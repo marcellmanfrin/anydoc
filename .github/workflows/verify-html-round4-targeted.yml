@@ -1,0 +1,17 @@
+name: Verify HTML round 4 targeted
+
+on:
+  push:
+    branches:
+      - verify/html-round4
+
+jobs:
+  html-targeted:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo test --locked --test html utf16
+      - run: cargo test --locked --test html
