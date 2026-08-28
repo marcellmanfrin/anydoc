@@ -213,9 +213,7 @@ impl TokenSink for HtmlComplexitySink {
 
 fn close_implied_before_start(open: &mut Vec<LocalName>, name: &str) {
     if is_heading_element(name)
-        && open
-            .last()
-            .is_some_and(|candidate| is_heading_element(candidate.as_ref()))
+        && open.last().is_some_and(|candidate| is_heading_element(candidate.as_ref()))
     {
         open.pop();
     }
@@ -265,8 +263,7 @@ fn html5_self_closing_is_honored(open: &[LocalName], name: &str) -> bool {
 fn is_foreign_content_html_breakout(name: &str) -> bool {
     matches!(
         name,
-        "b"
-            | "big"
+        "b" | "big"
             | "blockquote"
             | "body"
             | "br"
