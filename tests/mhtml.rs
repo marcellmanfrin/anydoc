@@ -103,7 +103,7 @@ Content-Type: text/html; charset=iso-8859-2
 Content-Transfer-Encoding: quoted-printable
 Content-Location: https://example.test/page
 
-<!doctype html><meta charset="utf-8"><p>=A3</p>
+<!doctype html><meta charset=3D"utf-8"><p>=A3</p>
 --b--
 "#,
     );
