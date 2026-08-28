@@ -1,0 +1,495 @@
+name: Apply deterministic MHTML review fixes
+
+on:
+  push:
+    branches: [verify/mhtml-cubic-review]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+      - name: Patch restacked MHTML branch and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Marcell Manfrin Barbacena"
+          git config user.email "barbacena@gmail.com"
+          git fetch origin verify/mhtml-rebuild verify/mhtml-cubic-review
+          git checkout -B verify/mhtml-rebuild origin/verify/mhtml-rebuild
+          git show origin/verify/mhtml-cubic-review:tests/mhtml.rs > tests/mhtml.rs
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_section(text: str, start_marker: str, end_marker: str, replacement: str) -> str:
+              start = text.index(start_marker)
+              end = text.index(end_marker, start)
+              return text[:start] + replacement + text[end:]
+
+          # Generalize the reviewed HTML frontend only at its MHTML integration
+          # boundary. The tokenizer preflight and DOM adaptation stay unchanged.
+          path = Path('src/formats/html.rs')
+          text = path.read_text()
+          text = text.replace(
+              'use crate::model::{AnchorId, Document, ImageSource, LinkTarget};',
+              'use crate::model::{AnchorId, Asset, Document, ImageSource, LinkTarget};',
+              1,
+          )
+          text = replace_section(
+              text,
+              'pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {',
+              '\nfn decode_html(bytes: &[u8]) -> String {',
+              '''pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
+              if bytes.len() as u64 > limits::MAX_ENTRY_BYTES {
+                  return Err(ConvertError::ResourceLimit {
+                      limit: "max_entry_bytes",
+                      detail: format!(
+                          "HTML input is {} bytes; maximum is {}",
+                          bytes.len(),
+                          limits::MAX_ENTRY_BYTES
+                      ),
+                  });
+              }
+
+              let text = decode_html(bytes);
+              parse_text_with_context(&text, None, &StandaloneCtx, Vec::new())
+          }
+
+          pub(crate) fn parse_text_with_context(
+              text: &str,
+              ordered_stylesheets: Option<&[String]>,
+              ctx: &dyn HtmlCtx,
+              assets: Vec<Asset>,
+          ) -> Result<Document, ConvertError> {
+              preflight_html_complexity(text)?;
+
+              let parsed = Html::parse_document(text);
+              let root = parsed.root_element();
+
+              let mut css = Stylesheet::default();
+              if let Some(stylesheets) = ordered_stylesheets {
+                  for stylesheet in stylesheets {
+                      css.add(stylesheet);
+                  }
+              } else {
+                  for style in root.descendent_elements().filter(|e| e.value().name() == "style") {
+                      css.add(&style.text().collect::<String>());
+                  }
+              }
+
+              let body = root
+                  .descendent_elements()
+                  .find(|e| e.value().name() == "body")
+                  .ok_or_else(|| ConvertError::malformed("HTML parser produced no body element"))?;
+
+              let mut node_count = 0usize;
+              let body = adapt_element(body, 1, &mut node_count)?;
+              let blocks = crate::shared::html::to_blocks(&body, &css, ctx)?;
+
+              Ok(Document { assets, blocks, ..Document::default() })
+          }
+          ''',
+          )
+          text = replace_section(
+              text,
+              'fn decode_html(bytes: &[u8]) -> String {',
+              '\nfn sniff_meta_charset(bytes: &[u8]) -> Option<&\'static Encoding> {',
+              '''pub(crate) fn decode_html(bytes: &[u8]) -> String {
+              decode_html_with_charset(bytes, None)
+          }
+
+          pub(crate) fn decode_html_with_charset(
+              bytes: &[u8],
+              declared_charset: Option<&str>,
+          ) -> String {
+              if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+                  return String::from_utf8_lossy(rest).into_owned();
+              }
+              if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+                  return UTF_16LE.decode(rest).0.into_owned();
+              }
+              if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+                  return UTF_16BE.decode(rest).0.into_owned();
+              }
+              if let Some(encoding) = declared_charset
+                  .and_then(|label| Encoding::for_label(label.trim().as_bytes()))
+              {
+                  return encoding.decode(bytes).0.into_owned();
+              }
+              if let Some(encoding) = sniff_meta_charset(bytes) {
+                  return encoding.decode(bytes).0.into_owned();
+              }
+              match std::str::from_utf8(bytes) {
+                  Ok(text) => text.to_owned(),
+                  Err(_) => WINDOWS_1252.decode(bytes).0.into_owned(),
+              }
+          }
+          ''',
+          )
+          path.write_text(text)
+
+          path = Path('src/formats/mhtml.rs')
+          text = path.read_text()
+          text = replace_section(
+              text,
+              'pub(crate) fn looks_like_mhtml(bytes: &[u8]) -> bool {',
+              '\nfn mime_header_block(bytes: &[u8]) -> &[u8] {',
+              '''pub(crate) fn looks_like_mhtml(bytes: &[u8]) -> bool {
+              let header = mime_header_block(bytes);
+              let unfolded = unfold_headers(header);
+              let lower = unfolded.to_ascii_lowercase();
+              let snapshot = lower
+                  .lines()
+                  .any(|line| line.starts_with("snapshot-content-location:"));
+
+              let Some(content_type) = lower
+                  .lines()
+                  .find_map(|line| line.strip_prefix("content-type:"))
+              else {
+                  return false;
+              };
+              let compact: String = content_type
+                  .chars()
+                  .filter(|c| !c.is_ascii_whitespace())
+                  .collect();
+
+              compact.starts_with("multipart/related") && snapshot
+          }
+          ''',
+          )
+          text = replace_section(
+              text,
+              'pub(crate) fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {',
+              '\nfn transfer_decoded_part_bytes(',
+              '''pub(crate) fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
+              if bytes.len() as u64 > limits::MAX_TOTAL_BYTES {
+                  return Err(ConvertError::ResourceLimit {
+                      limit: "max_total_bytes",
+                      detail: format!(
+                          "MHTML input is {} bytes; maximum is {}",
+                          bytes.len(),
+                          limits::MAX_TOTAL_BYTES
+                      ),
+                  });
+              }
+
+              let message = MessageParser::new()
+                  .with_mime_headers()
+                  .parse(bytes)
+                  .ok_or_else(|| ConvertError::malformed("MHTML MIME structure could not be parsed"))?;
+
+              if !message.is_content_type("multipart", "related") {
+                  return Err(ConvertError::malformed("MHTML root is not multipart/related"));
+              }
+
+              let start = message
+                  .content_type()
+                  .and_then(|content_type| content_type.attribute("start"))
+                  .map(normalize_content_id);
+
+              let (_, html_part) = if let Some(start) = start {
+                  message.parts.iter().enumerate().find(|(_, part)| {
+                      part.is_content_type("text", "html")
+                          && part
+                              .content_id()
+                              .map(normalize_content_id)
+                              .is_some_and(|content_id| content_id == start)
+                  })
+              } else {
+                  message
+                      .parts
+                      .iter()
+                      .enumerate()
+                      .find(|(_, part)| part.is_content_type("text", "html"))
+              }
+              .ok_or_else(|| ConvertError::malformed("MHTML contains no HTML root part"))?;
+
+              let html_bytes = transfer_decoded_part_bytes(&message, html_part, "HTML root")?;
+              if html_bytes.len() as u64 > limits::MAX_ENTRY_BYTES {
+                  return Err(ConvertError::ResourceLimit {
+                      limit: "max_entry_bytes",
+                      detail: format!(
+                          "MHTML HTML root is {} bytes; maximum is {}",
+                          html_bytes.len(),
+                          limits::MAX_ENTRY_BYTES
+                      ),
+                  });
+              }
+
+              let declared_charset = html_part
+                  .content_type()
+                  .and_then(|content_type| content_type.attribute("charset"));
+              let html = super::html::decode_html_with_charset(&html_bytes, declared_charset);
+              let root_location = html_part.content_location();
+
+              let resource_index = build_resource_index(&message.parts);
+              let (stylesheets, resource_base) = collect_stylesheets_in_order(
+                  &html,
+                  &message.parts,
+                  &resource_index,
+                  root_location,
+              )?;
+              let (assets, image_assets) = collect_image_assets(&message.parts)?;
+              let ctx = MhtmlCtx {
+                  image_assets,
+                  resource_base,
+              };
+
+              super::html::parse_text_with_context(&html, Some(&stylesheets), &ctx, assets)
+          }
+          ''',
+          )
+          text = replace_section(
+              text,
+              'fn collect_linked_css(',
+              '\nfn collect_image_assets(',
+              '''fn collect_stylesheets_in_order(
+              html: &str,
+              parts: &[mail_parser::MessagePart<'_>],
+              resource_index: &HashMap<String, usize>,
+              root_location: Option<&str>,
+          ) -> Result<(Vec<String>, Option<String>), ConvertError> {
+              let parsed = Html::parse_document(html);
+              let root = parsed.root_element();
+              let resource_base = root
+                  .descendent_elements()
+                  .find(|element| element.value().name() == "base")
+                  .and_then(|element| element.value().attr("href"))
+                  .map(|href| resolve_resource_reference(root_location, href))
+                  .or_else(|| root_location.map(canonical_reference));
+              let mut stylesheets = Vec::new();
+
+              for element in root.descendent_elements() {
+                  match element.value().name() {
+                      "style" => stylesheets.push(element.text().collect::<String>()),
+                      "link" => {
+                          let rel = element.value().attr("rel").unwrap_or("");
+                          if !rel
+                              .split_ascii_whitespace()
+                              .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+                          {
+                              continue;
+                          }
+                          let Some(href) = element.value().attr("href") else {
+                              continue;
+                          };
+                          let reference = resolve_resource_reference(resource_base.as_deref(), href);
+                          let Some(&part_index) = resource_index.get(&reference) else {
+                              continue;
+                          };
+                          let part = &parts[part_index];
+                          if !part.is_content_type("text", "css") {
+                              continue;
+                          }
+                          let Some(css) = part.text_contents() else {
+                              continue;
+                          };
+                          if css.len() as u64 > limits::MAX_ENTRY_BYTES {
+                              return Err(ConvertError::ResourceLimit {
+                                  limit: "max_entry_bytes",
+                                  detail: format!(
+                                      "MHTML stylesheet is {} bytes; maximum is {}",
+                                      css.len(),
+                                      limits::MAX_ENTRY_BYTES
+                                  ),
+                              });
+                          }
+                          stylesheets.push(css.to_owned());
+                      }
+                      _ => {}
+                  }
+              }
+
+              Ok((stylesheets, resource_base))
+          }
+          ''',
+          )
+          text = replace_section(
+              text,
+              'fn canonical_reference(value: &str) -> String {',
+              '\nstruct MhtmlCtx {',
+              '''fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+              let head = value.get(..prefix.len())?;
+              head.eq_ignore_ascii_case(prefix)
+                  .then(|| &value[prefix.len()..])
+          }
+
+          fn canonical_reference(value: &str) -> String {
+              let value = value.trim();
+              if let Some(content_id) = strip_prefix_ignore_ascii_case(value, "cid:") {
+                  format!("cid:{}", normalize_content_id(content_id))
+              } else {
+                  value.to_owned()
+              }
+          }
+
+          fn normalize_content_id(value: &str) -> String {
+              let value = value.trim();
+              let value = strip_prefix_ignore_ascii_case(value, "cid:").unwrap_or(value);
+              value.trim_matches(|c| matches!(c, '<' | '>')).to_string()
+          }
+
+          fn resolve_resource_reference(base: Option<&str>, value: &str) -> String {
+              let value = canonical_reference(value);
+              if value.is_empty() || value.starts_with("cid:") || is_absolute_uri(&value) {
+                  return value;
+              }
+              let Some(base) = base else {
+                  return value;
+              };
+              if value.starts_with("//") {
+                  return base
+                      .split_once(':')
+                      .map(|(scheme, _)| format!("{scheme}:{value}"))
+                      .unwrap_or(value);
+              }
+              let Some((scheme, rest)) = base.split_once("://") else {
+                  return value;
+              };
+              let authority_end = rest.find('/').unwrap_or(rest.len());
+              let authority = &rest[..authority_end];
+              let base_with_suffix = if authority_end < rest.len() {
+                  &rest[authority_end..]
+              } else {
+                  "/"
+              };
+              let (base_path, _) = split_path_suffix(base_with_suffix);
+              let (reference_path, suffix) = split_path_suffix(&value);
+              if reference_path.is_empty() {
+                  return format!("{scheme}://{authority}{base_path}{suffix}");
+              }
+              let joined = if reference_path.starts_with('/') {
+                  reference_path.to_owned()
+              } else {
+                  let directory_end = base_path.rfind('/').map_or(0, |index| index + 1);
+                  format!("{}{}", &base_path[..directory_end], reference_path)
+              };
+              format!(
+                  "{scheme}://{authority}{}{suffix}",
+                  normalize_url_path(&joined)
+              )
+          }
+
+          fn split_path_suffix(value: &str) -> (&str, &str) {
+              let query = value.find('?');
+              let fragment = value.find('#');
+              let index = match (query, fragment) {
+                  (Some(a), Some(b)) => Some(a.min(b)),
+                  (Some(a), None) | (None, Some(a)) => Some(a),
+                  (None, None) => None,
+              };
+              index.map_or((value, ""), |index| value.split_at(index))
+          }
+
+          fn normalize_url_path(path: &str) -> String {
+              let trailing_slash = path.ends_with('/');
+              let mut segments = Vec::new();
+              for segment in path.split('/') {
+                  match segment {
+                      "" | "." => {}
+                      ".." => {
+                          segments.pop();
+                      }
+                      _ => segments.push(segment),
+                  }
+              }
+              let mut normalized = String::from("/");
+              normalized.push_str(&segments.join("/"));
+              if trailing_slash && !normalized.ends_with('/') {
+                  normalized.push('/');
+              }
+              normalized
+          }
+          ''',
+          )
+          text = replace_section(
+              text,
+              'struct MhtmlCtx {',
+              '\nimpl HtmlCtx for MhtmlCtx {',
+              '''struct MhtmlCtx {
+              image_assets: HashMap<String, AssetId>,
+              resource_base: Option<String>,
+          }
+          ''',
+          )
+          impl_start = text.index('impl HtmlCtx for MhtmlCtx {')
+          image_start = text.index('    fn image_source(&self, src: &str)', impl_start)
+          anchor_start = text.index('    fn anchor_id(&self, raw: &str)', image_start)
+          image_method = '''    fn image_source(&self, src: &str) -> Result<Option<ImageSource>, ConvertError> {
+              let src = src.trim();
+              if src.is_empty() {
+                  return Ok(None);
+              }
+              let reference = resolve_resource_reference(self.resource_base.as_deref(), src);
+              if let Some(&asset_id) = self.image_assets.get(&reference) {
+                  return Ok(Some(ImageSource::Asset(asset_id)));
+              }
+              if reference.starts_with("cid:") {
+                  return Ok(Some(ImageSource::Unavailable));
+              }
+              Ok(is_absolute_uri(&reference).then(|| ImageSource::External(reference)))
+          }
+
+          '''
+          text = text[:image_start] + image_method + text[anchor_start:]
+          path.write_text(text)
+
+          path = Path('Cargo.toml')
+          text = path.read_text()
+          if 'mail-parser = ' not in text:
+              text = text.replace(
+                  'log = "0.4"\n',
+                  'log = "0.4"\nmail-parser = { version = "0.11.8", features = ["full_encoding"] }\n',
+                  1,
+              )
+          path.write_text(text)
+
+          path = Path('tests/mhtml_charset.rs')
+          text = path.read_text()
+          text = text.replace('use anydoc::to_markdown_bytes;', 'use anydoc::{Format, to_markdown_bytes};')
+          text = text.replace(
+              'to_markdown_bytes(mhtml, None)',
+              'to_markdown_bytes(mhtml, Some(Format::Mhtml))',
+          )
+          path.write_text(text)
+
+          for filename in ['node/mhtml.test.mjs', 'python/tests/test_mhtml.py']:
+              path = Path(filename)
+              text = path.read_text()
+              marker = 'MIME-Version: 1.0\\r\\n'
+              if 'Snapshot-Content-Location:' not in text:
+                  replacement = (
+                      'Snapshot-Content-Location: https://example.test/page\\r\\n' + marker
+                  )
+                  if filename.endswith('.mjs'):
+                      text = text.replace(
+                          "  'MIME-Version: 1.0\\r\\n' +",
+                          "  'Snapshot-Content-Location: https://example.test/page\\r\\n' +\n  'MIME-Version: 1.0\\r\\n' +",
+                          1,
+                      )
+                  else:
+                      text = text.replace(
+                          "    b'MIME-Version: 1.0\\r\\n'",
+                          "    b'Snapshot-Content-Location: https://example.test/page\\r\\n'\n    b'MIME-Version: 1.0\\r\\n'",
+                          1,
+                      )
+              path.write_text(text)
+          PY
+
+          cargo check --workspace --all-targets --all-features
+          cargo fmt --all
+          cargo test --locked --test mhtml --test mhtml_charset
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+          cargo test --locked
+          git diff --check
+          git add Cargo.toml Cargo.lock src/formats/html.rs src/formats/mhtml.rs tests/mhtml.rs tests/mhtml_charset.rs node/mhtml.test.mjs python/tests/test_mhtml.py
+          git commit -m "fix: address MHTML review findings"
+          git push origin HEAD:verify/mhtml-rebuild
