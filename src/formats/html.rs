@@ -36,26 +36,14 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
     }
 
     let text = decode_html(bytes);
-    parse_text_with_context(&text, &[], &StandaloneCtx, Vec::new())
-}
+    preflight_html_complexity(&text)?;
 
-pub(crate) fn parse_text_with_context(
-    text: &str,
-    extra_css: &[String],
-    ctx: &dyn HtmlCtx,
-    assets: Vec<crate::model::Asset>,
-) -> Result<Document, ConvertError> {
-    preflight_html_complexity(text)?;
-
-    let parsed = Html::parse_document(text);
+    let parsed = Html::parse_document(&text);
     let root = parsed.root_element();
 
     let mut css = Stylesheet::default();
     for style in root.descendent_elements().filter(|e| e.value().name() == "style") {
         css.add(&style.text().collect::<String>());
-    }
-    for stylesheet in extra_css {
-        css.add(stylesheet);
     }
 
     let body = root
@@ -65,16 +53,12 @@ pub(crate) fn parse_text_with_context(
 
     let mut node_count = 0usize;
     let body = adapt_element(body, 1, &mut node_count)?;
-    let blocks = crate::shared::html::to_blocks(&body, &css, ctx)?;
+    let blocks = crate::shared::html::to_blocks(&body, &css, &StandaloneCtx)?;
 
-    Ok(Document { assets, blocks, ..Document::default() })
+    Ok(Document { blocks, ..Document::default() })
 }
 
-pub(crate) fn decode_html(bytes: &[u8]) -> String {
-    decode_html_with_charset(bytes, None)
-}
-
-pub(crate) fn decode_html_with_charset(bytes: &[u8], declared_charset: Option<&str>) -> String {
+fn decode_html(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         return String::from_utf8_lossy(rest).into_owned();
     }
@@ -83,9 +67,6 @@ pub(crate) fn decode_html_with_charset(bytes: &[u8], declared_charset: Option<&s
     }
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         return UTF_16BE.decode(rest).0.into_owned();
-    }
-    if let Some(encoding) = declared_charset.and_then(|label| Encoding::for_label(label.as_bytes())) {
-        return encoding.decode(bytes).0.into_owned();
     }
     if let Some(encoding) = sniff_meta_charset(bytes) {
         return encoding.decode(bytes).0.into_owned();
