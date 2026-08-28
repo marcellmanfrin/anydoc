@@ -129,10 +129,7 @@ fn find_tag_end(bytes: &[u8]) -> Option<usize> {
 fn html_attr<'a>(attrs: &'a [u8], wanted: &[u8]) -> Option<&'a [u8]> {
     let mut pos = 0usize;
     while pos < attrs.len() {
-        while attrs
-            .get(pos)
-            .is_some_and(|b| b.is_ascii_whitespace() || *b == b'/')
-        {
+        while attrs.get(pos).is_some_and(|b| b.is_ascii_whitespace() || *b == b'/') {
             pos += 1;
         }
         if pos >= attrs.len() {
@@ -140,9 +137,10 @@ fn html_attr<'a>(attrs: &'a [u8], wanted: &[u8]) -> Option<&'a [u8]> {
         }
 
         let name_start = pos;
-        while attrs.get(pos).is_some_and(|b| {
-            !b.is_ascii_whitespace() && !matches!(b, b'=' | b'/' | b'>')
-        }) {
+        while attrs
+            .get(pos)
+            .is_some_and(|b| !b.is_ascii_whitespace() && !matches!(b, b'=' | b'/' | b'>'))
+        {
             pos += 1;
         }
         if pos == name_start {
@@ -350,9 +348,6 @@ mod tests {
 
     #[test]
     fn charset_sniff_ignores_non_meta_text_and_attributes() {
-        assert_eq!(
-            sniff_meta_charset(b"<p data-note='charset=windows-1252'>utf-8</p>"),
-            None
-        );
+        assert_eq!(sniff_meta_charset(b"<p data-note='charset=windows-1252'>utf-8</p>"), None);
     }
 }
