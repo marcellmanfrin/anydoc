@@ -1,0 +1,107 @@
+name: Verify MHTML full gate
+
+on:
+  push:
+    branches: [verify/mhtml-round2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust + MHTML real fixture
+    runs-on: ubuntu-24.04
+    env:
+      ANYDOC_VALIDATION_FIXTURE_URL: ${{ secrets.ANYDOC_VALIDATION_FIXTURE_URL }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: HTML and MHTML regression suites
+        run: cargo test --locked --test html --test mhtml
+      - name: Full Rust suite
+        run: cargo test --locked
+      - name: Validate real SEI MHTML
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANYDOC_VALIDATION_FIXTURE_URL"
+          curl -fsSL "$ANYDOC_VALIDATION_FIXTURE_URL" -o /tmp/fixture.mhtml
+          echo "387c6f2d7223da224a8f55962b97eac947734c97fc84888e1e5619e93745837c  /tmp/fixture.mhtml" | sha256sum -c -
+          cargo run --locked --example convert -- /tmp/fixture.mhtml -f mhtml -o /tmp/fixture.md --assets /tmp/fixture-assets
+          test -s /tmp/fixture.md
+          test "$(wc -c < /tmp/fixture.md)" -gt 1000
+          cp /tmp/fixture.mhtml /tmp/fixture.bin
+          cargo run --locked --example convert -- /tmp/fixture.bin -o /tmp/fixture-auto.md
+          cmp /tmp/fixture.md /tmp/fixture-auto.md
+          printf 'markdown-bytes='; wc -c < /tmp/fixture.md
+          printf 'asset-files='; find /tmp/fixture-assets -type f | wc -l
+          sha256sum /tmp/fixture.md
+
+  node:
+    name: Node bindings
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: node/package-lock.json
+      - run: npm ci
+        working-directory: node
+      - run: npm run build
+        working-directory: node
+      - run: npm test
+        working-directory: node
+      - name: Committed bindings are up to date
+        run: |
+          if ! git diff --exit-code -- node/index.js node/index.d.ts; then
+            echo "::error::node/index.js or node/index.d.ts is out of date. Run 'npm run build' in node/ and commit the result."
+            exit 1
+          fi
+
+  wasm:
+    name: Wasm bindings
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32-unknown-unknown
+      - run: cargo clippy -p anydoc-wasm --target wasm32-unknown-unknown -- -D warnings
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+      - name: Install wasm-pack
+        run: >
+          curl -sSfL https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.15.0/wasm-pack-v0.15.0-x86_64-unknown-linux-musl.tar.gz
+          | tar xz --strip-components=1 -C /usr/local/bin wasm-pack-v0.15.0-x86_64-unknown-linux-musl/wasm-pack
+      - run: wasm-pack build wasm --release --target web --scope firecrawl
+      - run: node --test wasm/test.mjs
+
+  python:
+    name: Python bindings
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: pip install maturin
+      - run: maturin build --release --locked --manifest-path python/Cargo.toml --out dist
+      - run: pip install --no-index --find-links dist firecrawl-anydoc
+      - run: python -m unittest discover -s python/tests
