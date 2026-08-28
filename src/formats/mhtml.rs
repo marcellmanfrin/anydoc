@@ -202,7 +202,7 @@ fn collect_image_assets(
             });
         }
         total_bytes = total_bytes.saturating_add(bytes.len() as u64);
-        if total_bytes > limits::MAX_ASSET_TOTAL_BYTES {
+        if total_bytes > limits::MAX_ASSET_TOTAL_BYTES as u64 {
             return Err(ConvertError::ResourceLimit {
                 limit: "max_asset_total_bytes",
                 detail: format!(
