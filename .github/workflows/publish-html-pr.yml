@@ -1,0 +1,29 @@
+name: Publish clean HTML support branch
+on:
+  push:
+    branches: [feature/html-support]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build clean branch from main
+        run: |
+          git fetch origin main feature/html-support
+          git switch -c feature/html-support-pr origin/main
+          git checkout origin/feature/html-support -- \
+            Cargo.toml Cargo.lock README.md \
+            node/cli.js node/html.test.mjs node/index.d.ts node/src/lib.rs \
+            python/anydoc/_anydoc.pyi python/src/lib.rs python/tests/test_html.py \
+            src/formats/detect.rs src/formats/html.rs src/formats/mod.rs src/lib.rs \
+            tests/html.rs wasm/src/lib.rs
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'feat: add standalone HTML support'
+          git push origin HEAD:feature/html-support-pr
