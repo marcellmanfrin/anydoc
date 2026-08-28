@@ -1,0 +1,14 @@
+name: MHTML verification
+on:
+  push:
+    branches: [feature/mhtml-support]
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+      - run: cargo test --test mhtml
