@@ -375,10 +375,7 @@ mod tests {
     #[test]
     fn charset_sniff_ignores_non_meta_text_and_attributes() {
         assert_eq!(sniff_meta_charset(b"<p data-note='charset=windows-1252'>utf-8</p>"), None);
-        assert_eq!(
-            sniff_meta_charset(b"<!-- <meta charset=windows-1252> --><p>utf-8</p>"),
-            None
-        );
+        assert_eq!(sniff_meta_charset(b"<!-- <meta charset=windows-1252> --><p>utf-8</p>"), None);
         assert_eq!(
             sniff_meta_charset(b"<script>const x='<meta charset=windows-1252>';</script>"),
             None

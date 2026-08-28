@@ -72,9 +72,9 @@ fn looks_like_utf16_html(bytes: &[u8], little_endian: bool) -> bool {
         }
     });
     let mut prefix = Vec::with_capacity(64);
-    if let Some(first) = units.find(|unit| {
-        !matches!(*unit, 0x0009 | 0x000A | 0x000C | 0x000D | 0x0020)
-    }) {
+    if let Some(first) =
+        units.find(|unit| !matches!(*unit, 0x0009 | 0x000A | 0x000C | 0x000D | 0x0020))
+    {
         prefix.push(first);
         prefix.extend(units.take(63));
     }

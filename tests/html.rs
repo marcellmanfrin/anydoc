@@ -74,8 +74,9 @@ fn meta_looking_text_in_comment_does_not_change_decoding() {
 
 #[test]
 fn meta_looking_text_in_script_does_not_change_decoding() {
-    let html = "<!doctype html><script>const fake = '<meta charset=windows-1252>';</script><p>café</p>"
-        .as_bytes();
+    let html =
+        "<!doctype html><script>const fake = '<meta charset=windows-1252>';</script><p>café</p>"
+            .as_bytes();
     let markdown = to_markdown_bytes(html, None).unwrap();
     assert_eq!(markdown, "café\n");
 }
@@ -89,10 +90,7 @@ fn html_node_limit_covers_nodes_outside_body_before_dom_materialization() {
     html.push_str("</head><body>ok</body></html>");
 
     let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
-    assert!(matches!(
-        error,
-        ConvertError::ResourceLimit { limit: "max_xml_nodes", .. }
-    ));
+    assert!(matches!(error, ConvertError::ResourceLimit { limit: "max_xml_nodes", .. }));
 }
 
 #[test]
