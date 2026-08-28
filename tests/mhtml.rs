@@ -359,7 +359,6 @@ AAECAw==
     }
 }
 
-
 #[test]
 fn mhtml_detection_requires_exact_related_media_type() {
     let mhtml = mhtml_fixture(

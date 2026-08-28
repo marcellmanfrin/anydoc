@@ -116,8 +116,12 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
     let resource_base = html_resource_base(&html, root_location);
 
     let resource_index = build_resource_index(&message.parts, resource_base.as_deref());
-    let stylesheets =
-        collect_stylesheets_in_order(&html, &message.parts, &resource_index, resource_base.as_deref())?;
+    let stylesheets = collect_stylesheets_in_order(
+        &html,
+        &message.parts,
+        &resource_index,
+        resource_base.as_deref(),
+    )?;
     let (assets, image_assets) = collect_image_assets(&message.parts, resource_base.as_deref())?;
     let ctx = MhtmlCtx { image_assets, resource_base };
 
@@ -281,10 +285,7 @@ fn collect_image_assets(
     Ok((assets, image_assets))
 }
 
-fn resource_keys(
-    part: &mail_parser::MessagePart<'_>,
-    resource_base: Option<&str>,
-) -> Vec<String> {
+fn resource_keys(part: &mail_parser::MessagePart<'_>, resource_base: Option<&str>) -> Vec<String> {
     let mut keys = Vec::new();
     if let Some(content_id) = part.content_id() {
         let id = normalize_content_id(content_id);

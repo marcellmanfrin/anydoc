@@ -133,7 +133,6 @@ fn scripts_are_not_document_content() {
     assert_eq!(markdown, "before\n\nafter\n");
 }
 
-
 #[test]
 fn quoted_mime_parameter_semicolon_does_not_fake_charset() {
     let mut html = b"<!doctype html><meta http-equiv=content-type content='text/html; note=\"x; charset=utf-8\"; charset=windows-1252'><p>".to_vec();
