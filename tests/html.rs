@@ -14,14 +14,8 @@ fn html_doctype_is_detected_from_content() {
 
 #[test]
 fn html_doctype_allows_html5_ascii_whitespace() {
-    assert_eq!(
-        Format::from_bytes(b"<!DOCTYPE\thtml><html></html>"),
-        Some(Format::Html)
-    );
-    assert_eq!(
-        Format::from_bytes(b"<!DOCTYPE\nhtml><html></html>"),
-        Some(Format::Html)
-    );
+    assert_eq!(Format::from_bytes(b"<!DOCTYPE\thtml><html></html>"), Some(Format::Html));
+    assert_eq!(Format::from_bytes(b"<!DOCTYPE\nhtml><html></html>"), Some(Format::Html));
 }
 
 #[test]
