@@ -112,12 +112,13 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
     let declared_charset =
         html_part.content_type().and_then(|content_type| content_type.attribute("charset"));
     let html = super::html::decode_html_with_charset(&html_bytes, declared_charset);
+    let parsed_html = Html::parse_document(&html);
     let root_location = html_part.content_location();
-    let resource_base = html_resource_base(&html, root_location);
+    let resource_base = html_resource_base(&parsed_html, root_location);
 
     let resource_index = build_resource_index(&message.parts, resource_base.as_deref());
     let stylesheets = collect_stylesheets_in_order(
-        &html,
+        &parsed_html,
         &message.parts,
         &resource_index,
         resource_base.as_deref(),
@@ -149,8 +150,7 @@ fn transfer_decoded_part_bytes(
     }
 }
 
-fn html_resource_base(html: &str, root_location: Option<&str>) -> Option<String> {
-    let parsed = Html::parse_document(html);
+fn html_resource_base(parsed: &Html, root_location: Option<&str>) -> Option<String> {
     let root = parsed.root_element();
     root.descendent_elements()
         .find(|element| element.value().name() == "base")
@@ -173,12 +173,11 @@ fn build_resource_index(
 }
 
 fn collect_stylesheets_in_order(
-    html: &str,
+    parsed: &Html,
     parts: &[mail_parser::MessagePart<'_>],
     resource_index: &HashMap<String, usize>,
     resource_base: Option<&str>,
 ) -> Result<Vec<String>, ConvertError> {
-    let parsed = Html::parse_document(html);
     let root = parsed.root_element();
     let mut stylesheets = Vec::new();
 
