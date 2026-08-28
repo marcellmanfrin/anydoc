@@ -1,0 +1,120 @@
+name: Verify MHTML review round 3
+on:
+  push:
+    branches: [verify/mhtml-review3-272d6a1]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  red:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: 272d6a154a94a2c6915b46c424db6fce08f5a95a}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Add PDF-before-HTML regression only
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          p='src/formats/detect.rs'
+          s=open(p).read()
+          needle='''    #[test]\n    fn container_signature_wins_over_an_early_embedded_pdf() {'''
+          test='''    #[test]\n    fn earlier_pdf_header_wins_over_later_html_marker() {\n        assert_eq!(from_bytes(b"%PDF-1.7\\n<html><body>x</body></html>"), Some(Format::Pdf));\n    }\n\n    #[test]\n    fn leading_html_marker_wins_over_later_embedded_pdf() {\n        assert_eq!(from_bytes(b"<html><body>%PDF-1.7</body></html>"), Some(Format::Html));\n    }\n\n'''
+          assert needle in s
+          open(p,'w').write(s.replace(needle,test+needle,1))
+          PY
+      - name: Prove regression fails on current head
+        shell: bash
+        run: |
+          set +e
+          cargo test earlier_pdf_header_wins_over_later_html_marker
+          rc=$?
+          if [ "$rc" -eq 0 ]; then echo 'Regression unexpectedly passed'; exit 1; fi
+          echo 'Expected RED reproduced'
+  candidate:
+    needs: red
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 272d6a154a94a2c6915b46c424db6fce08f5a95a
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: node/package-lock.json
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.13'}
+      - name: Apply regressions and minimal fixes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          p='src/formats/detect.rs'; s=open(p).read()
+          needle='''    #[test]\n    fn container_signature_wins_over_an_early_embedded_pdf() {'''
+          test='''    #[test]\n    fn earlier_pdf_header_wins_over_later_html_marker() {\n        assert_eq!(from_bytes(b"%PDF-1.7\\n<html><body>x</body></html>"), Some(Format::Pdf));\n    }\n\n    #[test]\n    fn leading_html_marker_wins_over_later_embedded_pdf() {\n        assert_eq!(from_bytes(b"<html><body>%PDF-1.7</body></html>"), Some(Format::Html));\n    }\n\n'''
+          assert needle in s; s=s.replace(needle,test+needle,1)
+          old='''    if looks_like_html(bytes) {\n        return Some(Format::Html);\n    }\n    if bytes[..bytes.len().min(1024)].windows(5).any(|w| w == b"%PDF-") {\n        return Some(Format::Pdf);\n    }'''
+          new='''    let pdf_position = bytes[..bytes.len().min(1024)].windows(5).position(|w| w == b"%PDF-");\n    if looks_like_html(bytes) {\n        if let (Some(pdf_position), Some(html_position)) = (pdf_position, ascii_html_marker_position(bytes))\n            && pdf_position < html_position\n        {\n            return Some(Format::Pdf);\n        }\n        return Some(Format::Html);\n    }\n    if pdf_position.is_some() {\n        return Some(Format::Pdf);\n    }'''
+          assert old in s; s=s.replace(old,new,1)
+          anchor='''fn looks_like_ascii_html(bytes: &[u8]) -> bool {\n    let bytes = bytes.trim_ascii_start();\n    html_doctype_prefix(bytes) || html_prefix(bytes, b"<html")\n}\n'''
+          helper='''fn ascii_html_marker_position(bytes: &[u8]) -> Option<usize> {\n    let bom_len = usize::from(bytes.starts_with(&[0xEF, 0xBB, 0xBF])) * 3;\n    let rest = &bytes[bom_len..];\n    let whitespace_len = rest.iter().take_while(|byte| byte.is_ascii_whitespace()).count();\n    let marker = &rest[whitespace_len..];\n    (html_doctype_prefix(marker) || html_prefix(marker, b"<html"))\n        .then_some(bom_len + whitespace_len)\n}\n\n'''
+          assert anchor in s; s=s.replace(anchor,anchor+'\n'+helper,1); open(p,'w').write(s)
+          p='src/formats/mhtml.rs'; s=open(p).read()
+          s=s.replace('''    let html = super::html::decode_html_with_charset(&html_bytes, declared_charset);\n    let root_location = html_part.content_location();\n    let resource_base = html_resource_base(&html, root_location);''','''    let html = super::html::decode_html_with_charset(&html_bytes, declared_charset);\n    let parsed_html = Html::parse_document(&html);\n    let root_location = html_part.content_location();\n    let resource_base = html_resource_base(&parsed_html, root_location);''',1)
+          s=s.replace('''    let stylesheets = collect_stylesheets_in_order(\n        &html,''','''    let stylesheets = collect_stylesheets_in_order(\n        &parsed_html,''',1)
+          s=s.replace('''fn html_resource_base(html: &str, root_location: Option<&str>) -> Option<String> {\n    let parsed = Html::parse_document(html);\n    let root = parsed.root_element();''','''fn html_resource_base(parsed: &Html, root_location: Option<&str>) -> Option<String> {\n    let root = parsed.root_element();''',1)
+          s=s.replace('''fn collect_stylesheets_in_order(\n    html: &str,''','''fn collect_stylesheets_in_order(\n    parsed: &Html,''',1)
+          s=s.replace('''    let parsed = Html::parse_document(html);\n    let root = parsed.root_element();\n    let mut stylesheets = Vec::new();''','''    let root = parsed.root_element();\n    let mut stylesheets = Vec::new();''',1)
+          open(p,'w').write(s)
+          PY
+          cargo fmt --all
+          git diff --check
+      - name: Targeted regressions
+        run: |
+          cargo test earlier_pdf_header_wins_over_later_html_marker
+          cargo test leading_html_marker_wins_over_later_embedded_pdf
+          cargo test ordinary_related_html_email_is_not_mhtml
+          cargo test --test mhtml
+          cargo test --test html
+      - name: Commit exact candidate before full gate
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/formats/detect.rs src/formats/mhtml.rs
+          git commit -m 'fix: address remaining MHTML review findings'
+          echo "CANDIDATE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Rust full gate
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --locked
+      - name: Node full gate
+        working-directory: node
+        run: |
+          npm ci
+          npm run build
+          npm test
+          cd ..
+          git diff --exit-code -- node/index.js node/index.d.ts
+      - name: WASM full gate
+        run: |
+          cargo clippy -p anydoc-wasm --target wasm32-unknown-unknown -- -D warnings
+          curl -sSfL https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.15.0/wasm-pack-v0.15.0-x86_64-unknown-linux-musl.tar.gz | tar xz --strip-components=1 -C /usr/local/bin wasm-pack-v0.15.0-x86_64-unknown-linux-musl/wasm-pack
+          wasm-pack build wasm --release --target web --scope firecrawl
+          node --test wasm/test.mjs
+      - name: Python full gate
+        run: |
+          pip install maturin
+          maturin build --release --locked --manifest-path python/Cargo.toml --out dist
+          pip install --no-index --find-links dist firecrawl-anydoc
+          python -m unittest discover -s python/tests
+      - name: Confirm candidate remained unchanged
+        run: test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+      - name: Publish validated candidate branch
+        run: git push origin HEAD:refs/heads/verify/mhtml-review3-candidate
