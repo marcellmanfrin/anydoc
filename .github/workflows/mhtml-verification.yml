@@ -3,13 +3,76 @@ on:
   push:
     branches: [feature/mhtml-support]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
 jobs:
-  test:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: rustfmt, clippy
-      - run: cargo test --test mhtml
-      - run: cargo test --workspace --no-run
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: node/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Generate lockfile
+        run: cargo generate-lockfile
+      - name: Rust formatting
+        run: cargo fmt --all --check
+      - name: Rust clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Rust tests
+        run: cargo test --locked
+
+      - name: Node install
+        working-directory: node
+        run: npm ci
+      - name: Node build
+        working-directory: node
+        run: npm run build
+      - name: Node tests
+        working-directory: node
+        run: npm test
+      - name: Generated Node bindings are current
+        run: git diff --exit-code -- node/index.js node/index.d.ts
+
+      - name: Install wasm-pack
+        run: >
+          curl -sSfL https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.15.0/wasm-pack-v0.15.0-x86_64-unknown-linux-musl.tar.gz
+          | tar xz --strip-components=1 -C /usr/local/bin wasm-pack-v0.15.0-x86_64-unknown-linux-musl/wasm-pack
+      - name: WASM clippy
+        run: cargo clippy -p anydoc-wasm --target wasm32-unknown-unknown -- -D warnings
+      - name: WASM build
+        run: wasm-pack build wasm --release --target web --scope firecrawl
+      - name: WASM tests
+        run: node --test wasm/test.mjs
+
+      - name: Install maturin
+        run: pip install maturin
+      - name: Build Python wheel
+        run: maturin build --release --locked --manifest-path python/Cargo.toml --out dist
+      - name: Install Python wheel
+        run: pip install --no-index --find-links dist firecrawl-anydoc
+      - name: Python tests
+        run: python -m unittest discover -s python/tests
+
+      - name: Package verification artifacts
+        run: |
+          mkdir -p verification-artifacts
+          cp Cargo.lock verification-artifacts/Cargo.lock
+          cp dist/*.whl verification-artifacts/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mhtml-verification-artifacts
+          path: verification-artifacts/
+          if-no-files-found: error
