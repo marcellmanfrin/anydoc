@@ -12,3 +12,4 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo test --test mhtml
+      - run: cargo test --workspace --no-run
