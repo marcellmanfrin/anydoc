@@ -98,7 +98,10 @@ fn sniff_meta_charset(bytes: &[u8]) -> Option<&'static Encoding> {
         let start = pos;
         while let Some(&byte) = prefix.get(pos) {
             let stop = quote.map_or_else(
-                || byte.is_ascii_whitespace() || matches!(byte, b';' | b'>' | b'/'),
+                || {
+                    byte.is_ascii_whitespace()
+                        || matches!(byte, b';' | b'>' | b'/' | b'\'' | b'"')
+                },
                 |q| byte == q,
             );
             if stop {
