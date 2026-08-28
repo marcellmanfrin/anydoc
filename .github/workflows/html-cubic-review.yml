@@ -8,24 +8,30 @@ permissions:
   contents: write
 
 jobs:
-  test:
+  promote:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: rustfmt, clippy
-      - name: Refresh lockfile once
+      - name: Assemble production HTML branch
         shell: bash
         run: |
-          cargo check --workspace --all-targets --all-features
-          if ! git diff --quiet -- Cargo.lock; then
-            git config user.name "Marcell Manfrin Barbacena"
-            git config user.email "barbacena@gmail.com"
-            git add Cargo.lock
-            git commit -m "build: record direct html5ever dependency"
-            git push
-          fi
+          git fetch origin feature/html-support-pr
+          git checkout -B promote-html origin/feature/html-support-pr
+          git checkout origin/verify/html-cubic-review -- \
+            Cargo.toml Cargo.lock src/formats/detect.rs src/formats/html.rs tests/html.rs
+          git diff --cached --check
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --test html
+      - run: cargo test --locked
+      - name: Commit and push HTML fixes
+        shell: bash
+        run: |
+          git config user.name "Marcell Manfrin Barbacena"
+          git config user.email "barbacena@gmail.com"
+          git commit -m "fix: address HTML review regressions"
+          git push origin HEAD:feature/html-support-pr
