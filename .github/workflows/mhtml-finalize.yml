@@ -1,0 +1,119 @@
+name: Finalize clean MHTML branch
+on:
+  push:
+    branches: [feature/mhtml-support]
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: node/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Resolve lockfile and stage verified MHTML files
+        run: |
+          cargo check -p anydoc
+          rm -rf /tmp/mhtml-clean
+          mkdir -p /tmp/mhtml-clean
+          files=(
+            Cargo.toml Cargo.lock
+            node/cli.js node/index.d.ts node/mhtml.test.mjs node/src/lib.rs
+            python/anydoc/_anydoc.pyi python/src/lib.rs python/tests/test_mhtml.py
+            src/formats/html.rs src/formats/mhtml.rs src/formats/mod.rs src/lib.rs
+            tests/mhtml.rs tests/mhtml_charset.rs
+            wasm/src/lib.rs
+          )
+          for f in "${files[@]}"; do
+            mkdir -p "/tmp/mhtml-clean/$(dirname "$f")"
+            cp "$f" "/tmp/mhtml-clean/$f"
+          done
+
+      - name: Assemble clean branch on current HTML PR
+        run: |
+          git fetch origin feature/html-support-pr
+          git checkout -B feature/mhtml-support-pr origin/feature/html-support-pr
+          cp -a /tmp/mhtml-clean/. .
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('README.md')
+          s = p.read_text()
+          html_row = '| HTML             | `.html`, `.htm`                                             |\n'
+          mhtml_row = '| MHTML            | `.mhtml`, `.mht`                                           |\n'
+          if mhtml_row not in s:
+              if s.count(html_row) != 1:
+                  raise SystemExit('expected exactly one HTML format row')
+              s = s.replace(html_row, html_row + mhtml_row, 1)
+              p.write_text(s)
+          PY
+          git diff --check
+
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Rust clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Rust tests
+        run: cargo test --locked
+
+      - name: Node install
+        working-directory: node
+        run: npm ci
+      - name: Node build
+        working-directory: node
+        run: npm run build
+      - name: Node tests
+        working-directory: node
+        run: npm test
+      - name: Generated Node bindings are current
+        run: git diff --exit-code -- node/index.js node/index.d.ts
+
+      - name: Install wasm-pack
+        run: >
+          curl -sSfL https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.15.0/wasm-pack-v0.15.0-x86_64-unknown-linux-musl.tar.gz
+          | tar xz --strip-components=1 -C /usr/local/bin wasm-pack-v0.15.0-x86_64-unknown-linux-musl/wasm-pack
+      - name: WASM clippy
+        run: cargo clippy --locked -p anydoc-wasm --target wasm32-unknown-unknown -- -D warnings
+      - name: WASM build
+        run: wasm-pack build wasm --release --target web --scope firecrawl --locked
+      - name: WASM tests
+        run: node --test wasm/test.mjs
+
+      - name: Install maturin
+        run: pip install maturin
+      - name: Build Python wheel
+        run: maturin build --release --locked --manifest-path python/Cargo.toml --out dist
+      - name: Install Python wheel
+        run: pip install --no-index --find-links dist firecrawl-anydoc
+      - name: Python tests
+        run: python -m unittest discover -s python/tests
+
+      - name: Commit and push clean branch
+        run: |
+          git config user.name "Marcell Manfrin Barbacena"
+          git config user.email "barbacena@gmail.com"
+          git add \
+            Cargo.toml Cargo.lock README.md \
+            node/cli.js node/index.d.ts node/mhtml.test.mjs node/src/lib.rs \
+            python/anydoc/_anydoc.pyi python/src/lib.rs python/tests/test_mhtml.py \
+            src/formats/html.rs src/formats/mhtml.rs src/formats/mod.rs src/lib.rs \
+            tests/mhtml.rs tests/mhtml_charset.rs \
+            wasm/src/lib.rs
+          git diff --cached --check
+          git diff --cached --stat
+          git commit -m "feat: add MHTML support"
+          git push --force origin HEAD:feature/mhtml-support-pr
