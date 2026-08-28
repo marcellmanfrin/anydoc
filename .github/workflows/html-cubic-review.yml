@@ -1,0 +1,16 @@
+name: HTML review regressions
+
+on:
+  push:
+    branches: [verify/html-cubic-review]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: cargo test --locked --test html
