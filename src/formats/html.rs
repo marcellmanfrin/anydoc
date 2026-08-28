@@ -61,7 +61,7 @@ pub(crate) fn parse_text_with_context(
     Ok(Document { blocks, assets, ..Document::default() })
 }
 
-fn decode_html(bytes: &[u8]) -> String {
+pub(crate) fn decode_html(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         return String::from_utf8_lossy(rest).into_owned();
     }

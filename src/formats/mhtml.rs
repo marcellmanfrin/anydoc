@@ -5,7 +5,8 @@ use crate::model::{AnchorId, Asset, AssetId, Document, ImageSource, LinkTarget};
 use crate::package::limits;
 use crate::shared::html::HtmlCtx;
 use crate::shared::uri::is_absolute_uri;
-use mail_parser::{MessageParser, MimeHeaders};
+use mail_parser::decoders::{base64::base64_decode, quoted_printable::quoted_printable_decode};
+use mail_parser::{Encoding, Message, MessageParser, MessagePart, MimeHeaders};
 use scraper::Html;
 use std::collections::HashMap;
 
@@ -102,26 +103,46 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
     }
     .ok_or_else(|| ConvertError::malformed("MHTML contains no HTML root part"))?;
 
-    let html = html_part
-        .text_contents()
-        .ok_or_else(|| ConvertError::malformed("MHTML HTML root is not decodable text"))?;
-    if html.len() as u64 > limits::MAX_ENTRY_BYTES {
+    let html_bytes = transfer_decoded_part_bytes(&message, html_part, "HTML root")?;
+    if html_bytes.len() as u64 > limits::MAX_ENTRY_BYTES {
         return Err(ConvertError::ResourceLimit {
             limit: "max_entry_bytes",
             detail: format!(
                 "MHTML HTML root is {} bytes; maximum is {}",
-                html.len(),
+                html_bytes.len(),
                 limits::MAX_ENTRY_BYTES
             ),
         });
     }
+    let html = super::html::decode_html(&html_bytes);
 
     let resource_index = build_resource_index(&message.parts);
-    let extra_css = collect_linked_css(html, &message.parts, &resource_index)?;
+    let extra_css = collect_linked_css(&html, &message.parts, &resource_index)?;
     let (assets, image_assets) = collect_image_assets(&message.parts)?;
     let ctx = MhtmlCtx { image_assets };
 
-    super::html::parse_text_with_context(html, &extra_css, &ctx, assets)
+    super::html::parse_text_with_context(&html, &extra_css, &ctx, assets)
+}
+
+fn transfer_decoded_part_bytes(
+    message: &Message<'_>,
+    part: &MessagePart<'_>,
+    label: &str,
+) -> Result<Vec<u8>, ConvertError> {
+    let raw = message
+        .raw_message
+        .get(part.offset_body as usize..part.offset_end as usize)
+        .ok_or_else(|| ConvertError::malformed(format!("MHTML {label} byte range is invalid")))?;
+
+    match part.encoding {
+        Encoding::None => Ok(raw.to_vec()),
+        Encoding::QuotedPrintable => quoted_printable_decode(raw).ok_or_else(|| {
+            ConvertError::malformed(format!("MHTML {label} quoted-printable body is invalid"))
+        }),
+        Encoding::Base64 => base64_decode(raw).ok_or_else(|| {
+            ConvertError::malformed(format!("MHTML {label} base64 body is invalid"))
+        }),
+    }
 }
 
 fn build_resource_index(parts: &[mail_parser::MessagePart<'_>]) -> HashMap<String, usize> {
