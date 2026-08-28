@@ -2,6 +2,7 @@ import unittest
 import anydoc
 
 INPUT = (
+    b'Snapshot-Content-Location: https://example.test/page\r\n'
     b'MIME-Version: 1.0\r\n'
     b'Content-Type: multipart/related; type="text/html"; boundary="b"\r\n\r\n'
     b'--b\r\nContent-Type: text/html\r\n\r\n'

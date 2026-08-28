@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { formatFromBytes, formatFromExtension, toMarkdownBytes } from './index.js'
 
 const input = Buffer.from(
+  'Snapshot-Content-Location: https://example.test/page\r\n' +
   'MIME-Version: 1.0\r\n' +
   'Content-Type: multipart/related; type="text/html"; boundary="b"\r\n\r\n' +
   '--b\r\nContent-Type: text/html\r\n\r\n' +

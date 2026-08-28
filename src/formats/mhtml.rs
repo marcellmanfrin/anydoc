@@ -23,14 +23,8 @@ pub(crate) fn looks_like_mhtml(bytes: &[u8]) -> bool {
         return false;
     };
     let compact: String = content_type.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-    if !compact.starts_with("multipart/related") {
-        return false;
-    }
 
-    snapshot
-        || compact.contains("type=\"text/html\"")
-        || compact.contains("type=text/html")
-        || compact.contains("type='text/html'")
+    compact.starts_with("multipart/related") && snapshot
 }
 
 fn mime_header_block(bytes: &[u8]) -> &[u8] {
@@ -114,14 +108,19 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
             ),
         });
     }
-    let html = super::html::decode_html(&html_bytes);
+
+    let declared_charset =
+        html_part.content_type().and_then(|content_type| content_type.attribute("charset"));
+    let html = super::html::decode_html_with_charset(&html_bytes, declared_charset);
+    let root_location = html_part.content_location();
 
     let resource_index = build_resource_index(&message.parts);
-    let extra_css = collect_linked_css(&html, &message.parts, &resource_index)?;
+    let (stylesheets, resource_base) =
+        collect_stylesheets_in_order(&html, &message.parts, &resource_index, root_location)?;
     let (assets, image_assets) = collect_image_assets(&message.parts)?;
-    let ctx = MhtmlCtx { image_assets };
+    let ctx = MhtmlCtx { image_assets, resource_base };
 
-    super::html::parse_text_with_context(&html, &extra_css, &ctx, assets)
+    super::html::parse_text_with_context(&html, Some(&stylesheets), &ctx, assets)
 }
 
 fn transfer_decoded_part_bytes(
@@ -155,47 +154,64 @@ fn build_resource_index(parts: &[mail_parser::MessagePart<'_>]) -> HashMap<Strin
     index
 }
 
-fn collect_linked_css(
+fn collect_stylesheets_in_order(
     html: &str,
     parts: &[mail_parser::MessagePart<'_>],
     resource_index: &HashMap<String, usize>,
-) -> Result<Vec<String>, ConvertError> {
+    root_location: Option<&str>,
+) -> Result<(Vec<String>, Option<String>), ConvertError> {
     let parsed = Html::parse_document(html);
     let root = parsed.root_element();
+    let resource_base = root
+        .descendent_elements()
+        .find(|element| element.value().name() == "base")
+        .and_then(|element| element.value().attr("href"))
+        .map(|href| resolve_resource_reference(root_location, href))
+        .or_else(|| root_location.map(canonical_reference));
     let mut stylesheets = Vec::new();
 
-    for link in root.descendent_elements().filter(|element| element.value().name() == "link") {
-        let rel = link.value().attr("rel").unwrap_or("");
-        if !rel.split_ascii_whitespace().any(|token| token.eq_ignore_ascii_case("stylesheet")) {
-            continue;
+    for element in root.descendent_elements() {
+        match element.value().name() {
+            "style" => stylesheets.push(element.text().collect::<String>()),
+            "link" => {
+                let rel = element.value().attr("rel").unwrap_or("");
+                if !rel
+                    .split_ascii_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+                {
+                    continue;
+                }
+                let Some(href) = element.value().attr("href") else {
+                    continue;
+                };
+                let reference = resolve_resource_reference(resource_base.as_deref(), href);
+                let Some(&part_index) = resource_index.get(&reference) else {
+                    continue;
+                };
+                let part = &parts[part_index];
+                if !part.is_content_type("text", "css") {
+                    continue;
+                }
+                let Some(css) = part.text_contents() else {
+                    continue;
+                };
+                if css.len() as u64 > limits::MAX_ENTRY_BYTES {
+                    return Err(ConvertError::ResourceLimit {
+                        limit: "max_entry_bytes",
+                        detail: format!(
+                            "MHTML stylesheet is {} bytes; maximum is {}",
+                            css.len(),
+                            limits::MAX_ENTRY_BYTES
+                        ),
+                    });
+                }
+                stylesheets.push(css.to_owned());
+            }
+            _ => {}
         }
-        let Some(href) = link.value().attr("href") else {
-            continue;
-        };
-        let Some(&part_index) = resource_index.get(&canonical_reference(href)) else {
-            continue;
-        };
-        let part = &parts[part_index];
-        if !part.is_content_type("text", "css") {
-            continue;
-        }
-        let Some(css) = part.text_contents() else {
-            continue;
-        };
-        if css.len() as u64 > limits::MAX_ENTRY_BYTES {
-            return Err(ConvertError::ResourceLimit {
-                limit: "max_entry_bytes",
-                detail: format!(
-                    "MHTML stylesheet is {} bytes; maximum is {}",
-                    css.len(),
-                    limits::MAX_ENTRY_BYTES
-                ),
-            });
-        }
-        stylesheets.push(css.to_owned());
     }
 
-    Ok(stylesheets)
+    Ok((stylesheets, resource_base))
 }
 
 fn collect_image_assets(
@@ -274,9 +290,14 @@ fn resource_keys(part: &mail_parser::MessagePart<'_>) -> Vec<String> {
     keys
 }
 
+fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = value.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then(|| &value[prefix.len()..])
+}
+
 fn canonical_reference(value: &str) -> String {
     let value = value.trim();
-    if let Some(content_id) = value.strip_prefix("cid:") {
+    if let Some(content_id) = strip_prefix_ignore_ascii_case(value, "cid:") {
         format!("cid:{}", normalize_content_id(content_id))
     } else {
         value.to_owned()
@@ -285,12 +306,78 @@ fn canonical_reference(value: &str) -> String {
 
 fn normalize_content_id(value: &str) -> String {
     let value = value.trim();
-    let value = value.strip_prefix("cid:").unwrap_or(value);
+    let value = strip_prefix_ignore_ascii_case(value, "cid:").unwrap_or(value);
     value.trim_matches(|c| matches!(c, '<' | '>')).to_string()
+}
+
+fn resolve_resource_reference(base: Option<&str>, value: &str) -> String {
+    let value = canonical_reference(value);
+    if value.is_empty() || value.starts_with("cid:") || is_absolute_uri(&value) {
+        return value;
+    }
+    let Some(base) = base else {
+        return value;
+    };
+    if value.starts_with("//") {
+        return base
+            .split_once(':')
+            .map(|(scheme, _)| format!("{scheme}:{value}"))
+            .unwrap_or(value);
+    }
+    let Some((scheme, rest)) = base.split_once("://") else {
+        return value;
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let base_with_suffix = if authority_end < rest.len() { &rest[authority_end..] } else { "/" };
+    let (base_path, _) = split_path_suffix(base_with_suffix);
+    let (reference_path, suffix) = split_path_suffix(&value);
+    if reference_path.is_empty() {
+        return format!("{scheme}://{authority}{base_path}{suffix}");
+    }
+    let joined = if reference_path.starts_with('/') {
+        reference_path.to_owned()
+    } else {
+        let directory_end = base_path.rfind('/').map_or(0, |index| index + 1);
+        format!("{}{}", &base_path[..directory_end], reference_path)
+    };
+    format!("{scheme}://{authority}{}{suffix}", normalize_url_path(&joined))
+}
+
+fn split_path_suffix(value: &str) -> (&str, &str) {
+    let query = value.find('?');
+    let fragment = value.find('#');
+    let index = match (query, fragment) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+    index.map_or((value, ""), |index| value.split_at(index))
+}
+
+fn normalize_url_path(path: &str) -> String {
+    let trailing_slash = path.ends_with('/');
+    let mut segments = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            _ => segments.push(segment),
+        }
+    }
+    let mut normalized = String::from("/");
+    normalized.push_str(&segments.join("/"));
+    if trailing_slash && !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    normalized
 }
 
 struct MhtmlCtx {
     image_assets: HashMap<String, AssetId>,
+    resource_base: Option<String>,
 }
 
 impl HtmlCtx for MhtmlCtx {
@@ -315,13 +402,14 @@ impl HtmlCtx for MhtmlCtx {
         if src.is_empty() {
             return Ok(None);
         }
-        if let Some(&asset_id) = self.image_assets.get(&canonical_reference(src)) {
+        let reference = resolve_resource_reference(self.resource_base.as_deref(), src);
+        if let Some(&asset_id) = self.image_assets.get(&reference) {
             return Ok(Some(ImageSource::Asset(asset_id)));
         }
-        if src.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("cid:")) {
+        if reference.starts_with("cid:") {
             return Ok(Some(ImageSource::Unavailable));
         }
-        Ok(is_absolute_uri(src).then(|| ImageSource::External(src.to_owned())))
+        Ok(is_absolute_uri(&reference).then_some(ImageSource::External(reference)))
     }
 
     fn anchor_id(&self, raw: &str) -> AnchorId {

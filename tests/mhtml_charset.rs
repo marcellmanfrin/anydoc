@@ -1,4 +1,4 @@
-use anydoc::to_markdown_bytes;
+use anydoc::{Format, to_markdown_bytes};
 
 #[test]
 fn html_meta_charset_is_used_when_mime_charset_is_missing() {
@@ -12,5 +12,5 @@ Content-Transfer-Encoding: quoted-printable\r\n\
 <!doctype html><meta http-equiv=3D\"Content-Type\" content=3D\"text/html; charset=3Dwindows-1252\"><p>Contrata=E7=E3o dever=E1</p>\r\n\
 --b--\r\n";
 
-    assert_eq!(to_markdown_bytes(mhtml, None).unwrap(), "Contratação deverá\n");
+    assert_eq!(to_markdown_bytes(mhtml, Some(Format::Mhtml)).unwrap(), "Contratação deverá\n");
 }
