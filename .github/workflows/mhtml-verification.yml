@@ -27,103 +27,119 @@ jobs:
 
       - name: Apply MHTML charset fix after RED regression
         run: |
-          cat > /tmp/mhtml-charset.patch <<'PATCH'
-          diff --git a/src/formats/html.rs b/src/formats/html.rs
-          --- a/src/formats/html.rs
-          +++ b/src/formats/html.rs
-          @@ -61,7 +61,7 @@ pub(crate) fn parse_text_with_context(
-               Ok(Document { blocks, assets, ..Document::default() })
-           }
-           
-          -fn decode_html(bytes: &[u8]) -> String {
-          +pub(crate) fn decode_html(bytes: &[u8]) -> String {
-               if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-                   return String::from_utf8_lossy(rest).into_owned();
-               }
-          diff --git a/src/formats/mhtml.rs b/src/formats/mhtml.rs
-          --- a/src/formats/mhtml.rs
-          +++ b/src/formats/mhtml.rs
-          @@ -5,7 +5,8 @@ use crate::package::limits;
-           use crate::shared::html::HtmlCtx;
-           use crate::shared::uri::is_absolute_uri;
-          -use mail_parser::{MessageParser, MimeHeaders};
-          +use mail_parser::decoders::{base64::base64_decode, quoted_printable::quoted_printable_decode};
-          +use mail_parser::{Encoding, Message, MessageParser, MessagePart, MimeHeaders};
-           use scraper::Html;
-           use std::collections::HashMap;
-           
-          @@ -82,18 +83,17 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
-               }
-               .ok_or_else(|| ConvertError::malformed("MHTML contains no HTML root part"))?;
-           
-          -    let html = html_part
-          -        .text_contents()
-          -        .ok_or_else(|| ConvertError::malformed("MHTML HTML root is not decodable text"))?;
-          -    if html.len() as u64 > limits::MAX_ENTRY_BYTES {
-          +    let html_bytes = transfer_decoded_part_bytes(&message, html_part, "HTML root")?;
-          +    if html_bytes.len() as u64 > limits::MAX_ENTRY_BYTES {
-                   return Err(ConvertError::ResourceLimit {
-                       limit: "max_entry_bytes",
-                       detail: format!(
-                           "MHTML HTML root is {} bytes; maximum is {}",
-          -                html.len(),
-          +                html_bytes.len(),
-                           limits::MAX_ENTRY_BYTES
-                       ),
-                   });
-               }
-          +    let html = super::html::decode_html(&html_bytes);
-           
-               let resource_index = build_resource_index(&message.parts);
-          -    let extra_css = collect_linked_css(html, &message.parts, &resource_index)?;
-          +    let extra_css = collect_linked_css(&html, &message.parts, &resource_index)?;
-               let (assets, image_assets) = collect_image_assets(&message.parts)?;
-               let ctx = MhtmlCtx { image_assets };
-           
-          -    super::html::parse_text_with_context(html, &extra_css, &ctx, assets)
-          +    super::html::parse_text_with_context(&html, &extra_css, &ctx, assets)
-           }
-           
-          +fn transfer_decoded_part_bytes(
-          +    message: &Message<'_>,
-          +    part: &MessagePart<'_>,
-          +    label: &str,
-          +) -> Result<Vec<u8>, ConvertError> {
-          +    let raw = message
-          +        .raw_message
-          +        .get(part.offset_body as usize..part.offset_end as usize)
-          +        .ok_or_else(|| ConvertError::malformed(format!("MHTML {label} byte range is invalid")))?;
-          +
-          +    match part.encoding {
-          +        Encoding::None => Ok(raw.to_vec()),
-          +        Encoding::QuotedPrintable => quoted_printable_decode(raw).ok_or_else(|| {
-          +            ConvertError::malformed(format!("MHTML {label} quoted-printable body is invalid"))
-          +        }),
-          +        Encoding::Base64 => base64_decode(raw).ok_or_else(|| {
-          +            ConvertError::malformed(format!("MHTML {label} base64 body is invalid"))
-          +        }),
-          +    }
-          +}
-          +
-           fn build_resource_index(parts: &[mail_parser::MessagePart<'_>]) -> HashMap<String, usize> {
-               let mut index = HashMap::new();
-               for (part_index, part) in parts.iter().enumerate() {
-          PATCH
+          python3 - <<'PY'
+          from pathlib import Path
 
-          if git apply --check /tmp/mhtml-charset.patch; then
-            git apply /tmp/mhtml-charset.patch
-            cargo fmt --all
-            cargo test --test mhtml_charset
+          html_path = Path('src/formats/html.rs')
+          html = html_path.read_text()
+          old = 'fn decode_html(bytes: &[u8]) -> String {'
+          new = 'pub(crate) fn decode_html(bytes: &[u8]) -> String {'
+          if old in html:
+              if html.count(old) != 1:
+                  raise SystemExit('unexpected decode_html match count')
+              html_path.write_text(html.replace(old, new, 1))
+          elif new not in html:
+              raise SystemExit('decode_html signature not found')
+
+          mhtml_path = Path('src/formats/mhtml.rs')
+          mhtml = mhtml_path.read_text()
+          marker = 'fn transfer_decoded_part_bytes('
+          if marker not in mhtml:
+              old_import = 'use mail_parser::{MessageParser, MimeHeaders};'
+              new_import = '''use mail_parser::decoders::{
+              base64::base64_decode, quoted_printable::quoted_printable_decode,
+          };
+          use mail_parser::{Encoding, Message, MessageParser, MessagePart, MimeHeaders};'''
+              if mhtml.count(old_import) != 1:
+                  raise SystemExit('unexpected mail_parser import match count')
+              mhtml = mhtml.replace(old_import, new_import, 1)
+
+              old_parse = '''    let html = html_part
+                  .text_contents()
+                  .ok_or_else(|| ConvertError::malformed("MHTML HTML root is not decodable text"))?;
+              if html.len() as u64 > limits::MAX_ENTRY_BYTES {
+                  return Err(ConvertError::ResourceLimit {
+                      limit: "max_entry_bytes",
+                      detail: format!(
+                          "MHTML HTML root is {} bytes; maximum is {}",
+                          html.len(),
+                          limits::MAX_ENTRY_BYTES
+                      ),
+                  });
+              }
+
+              let resource_index = build_resource_index(&message.parts);
+              let extra_css = collect_linked_css(html, &message.parts, &resource_index)?;
+              let (assets, image_assets) = collect_image_assets(&message.parts)?;
+              let ctx = MhtmlCtx { image_assets };
+
+              super::html::parse_text_with_context(html, &extra_css, &ctx, assets)
+          }'''
+              new_parse = '''    let html_bytes = transfer_decoded_part_bytes(&message, html_part, "HTML root")?;
+              if html_bytes.len() as u64 > limits::MAX_ENTRY_BYTES {
+                  return Err(ConvertError::ResourceLimit {
+                      limit: "max_entry_bytes",
+                      detail: format!(
+                          "MHTML HTML root is {} bytes; maximum is {}",
+                          html_bytes.len(),
+                          limits::MAX_ENTRY_BYTES
+                      ),
+                  });
+              }
+              let html = super::html::decode_html(&html_bytes);
+
+              let resource_index = build_resource_index(&message.parts);
+              let extra_css = collect_linked_css(&html, &message.parts, &resource_index)?;
+              let (assets, image_assets) = collect_image_assets(&message.parts)?;
+              let ctx = MhtmlCtx { image_assets };
+
+              super::html::parse_text_with_context(&html, &extra_css, &ctx, assets)
+          }'''
+              if mhtml.count(old_parse) != 1:
+                  raise SystemExit('unexpected MHTML parse block match count')
+              mhtml = mhtml.replace(old_parse, new_parse, 1)
+
+              insertion = '''fn transfer_decoded_part_bytes(
+              message: &Message<'_>,
+              part: &MessagePart<'_>,
+              label: &str,
+          ) -> Result<Vec<u8>, ConvertError> {
+              let raw = message
+                  .raw_message
+                  .get(part.offset_body as usize..part.offset_end as usize)
+                  .ok_or_else(|| {
+                      ConvertError::malformed(format!("MHTML {label} byte range is invalid"))
+                  })?;
+
+              match part.encoding {
+                  Encoding::None => Ok(raw.to_vec()),
+                  Encoding::QuotedPrintable => quoted_printable_decode(raw).ok_or_else(|| {
+                      ConvertError::malformed(format!(
+                          "MHTML {label} quoted-printable body is invalid"
+                      ))
+                  }),
+                  Encoding::Base64 => base64_decode(raw).ok_or_else(|| {
+                      ConvertError::malformed(format!("MHTML {label} base64 body is invalid"))
+                  }),
+              }
+          }
+
+          '''
+              anchor = 'fn build_resource_index(parts: &[mail_parser::MessagePart<\'_>]) -> HashMap<String, usize> {'
+              if mhtml.count(anchor) != 1:
+                  raise SystemExit('unexpected build_resource_index anchor count')
+              mhtml = mhtml.replace(anchor, insertion + anchor, 1)
+              mhtml_path.write_text(mhtml)
+          PY
+
+          cargo fmt --all
+          cargo test --test mhtml_charset
+          if ! git diff --quiet -- src/formats/html.rs src/formats/mhtml.rs; then
             git config user.name "Marcell Manfrin Barbacena"
             git config user.email "barbacena@gmail.com"
             git add src/formats/html.rs src/formats/mhtml.rs
             git commit -m "fix: honor HTML meta charset in MHTML parts"
             git push origin HEAD:feature/mhtml-support
-          elif grep -q 'transfer_decoded_part_bytes' src/formats/mhtml.rs; then
-            echo 'Charset fix already present.'
-          else
-            echo 'Charset patch no longer applies and fix marker is absent.' >&2
-            exit 1
           fi
 
       # Update the existing lockfile only as needed for the new direct dependency.
