@@ -50,6 +50,31 @@ Content-Type: text/html
 }
 
 #[test]
+fn ordinary_related_html_email_is_not_mhtml() {
+    let email = mhtml_fixture(
+        r#"From: sender@example.test
+To: recipient@example.test
+Subject: Inline image
+MIME-Version: 1.0
+Content-Type: multipart/related; type="text/html"; boundary="b"
+
+--b
+Content-Type: text/html; charset=utf-8
+
+<p>Hello <img src="cid:image@id"></p>
+--b
+Content-Type: image/png
+Content-ID: <image@id>
+Content-Transfer-Encoding: base64
+
+AAECAw==
+--b--
+"#,
+    );
+    assert_eq!(Format::from_bytes(&email), None);
+}
+
+#[test]
 fn quoted_printable_html_root_converts() {
     let mhtml = mhtml_fixture(
         r#"MIME-Version: 1.0
@@ -64,7 +89,25 @@ Content-Location: https://example.test/page
 --b--
 "#,
     );
-    assert_eq!(to_markdown_bytes(&mhtml, None).unwrap(), "café\n");
+    assert_eq!(to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap(), "café\n");
+}
+
+#[test]
+fn mime_charset_overrides_html_fallback() {
+    let mhtml = mhtml_fixture(
+        r#"MIME-Version: 1.0
+Content-Type: multipart/related; type="text/html"; boundary="b"
+
+--b
+Content-Type: text/html; charset=iso-8859-2
+Content-Transfer-Encoding: quoted-printable
+Content-Location: https://example.test/page
+
+<!doctype html><p>=A3</p>
+--b--
+"#,
+    );
+    assert_eq!(to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap(), "Ł\n");
 }
 
 #[test]
@@ -86,7 +129,29 @@ Content-ID: <root@id>
 --b--
 "#,
     );
-    assert_eq!(to_markdown_bytes(&mhtml, None).unwrap(), "right root\n");
+    assert_eq!(to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap(), "right root\n");
+}
+
+#[test]
+fn uppercase_cid_start_parameter_selects_the_related_html_root() {
+    let mhtml = mhtml_fixture(
+        r#"MIME-Version: 1.0
+Content-Type: multipart/related; type="text/html"; start="CID:root@id"; boundary="b"
+
+--b
+Content-Type: text/html
+Content-ID: <other@id>
+
+<p>wrong root</p>
+--b
+Content-Type: text/html
+Content-ID: <root@id>
+
+<p>right root</p>
+--b--
+"#,
+    );
+    assert_eq!(to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap(), "right root\n");
 }
 
 #[test]
@@ -125,7 +190,109 @@ Content-ID: <style@id>
 --b--
 "#,
     );
-    assert_eq!(to_markdown_bytes(&mhtml, None).unwrap(), "**keep me**\n");
+    assert_eq!(to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap(), "**keep me**\n");
+}
+
+#[test]
+fn linked_css_and_inline_style_preserve_document_order() {
+    let mhtml = mhtml_fixture(
+        r#"MIME-Version: 1.0
+Content-Type: multipart/related; type="text/html"; boundary="b"
+
+--b
+Content-Type: text/html
+
+<!doctype html><link rel="stylesheet" href="cid:style@id"><style>.strong { font-weight: normal }</style><p class="strong">keep me</p>
+--b
+Content-Type: text/css; charset=utf-8
+Content-ID: <style@id>
+
+.strong { font-weight: bold }
+--b--
+"#,
+    );
+    assert_eq!(to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap(), "keep me\n");
+}
+
+#[test]
+fn relative_linked_css_resolves_against_root_content_location() {
+    let mhtml = mhtml_fixture(
+        r#"MIME-Version: 1.0
+Content-Type: multipart/related; type="text/html"; boundary="b"
+
+--b
+Content-Type: text/html; charset=utf-8
+Content-Location: https://example.test/docs/page.html
+
+<!doctype html><link rel="stylesheet" href="styles/site.css"><p class="strong">keep me</p>
+--b
+Content-Type: text/css; charset=utf-8
+Content-Location: https://example.test/docs/styles/site.css
+
+.strong { font-weight: bold }
+--b--
+"#,
+    );
+    assert_eq!(to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap(), "**keep me**\n");
+}
+
+#[test]
+fn html_base_href_resolves_relative_embedded_image() {
+    let mhtml = mhtml_fixture(
+        r#"MIME-Version: 1.0
+Content-Type: multipart/related; type="text/html"; boundary="b"
+
+--b
+Content-Type: text/html; charset=utf-8
+Content-Location: https://example.test/docs/page.html
+
+<!doctype html><base href="https://cdn.example.test/assets/"><p><img alt="pixel" src="pixel.png"></p>
+--b
+Content-Type: image/png
+Content-Location: https://cdn.example.test/assets/pixel.png
+Content-Transfer-Encoding: base64
+
+AAECAw==
+--b--
+"#,
+    );
+    let document = to_document(&mhtml, Some(Format::Mhtml)).unwrap();
+    match &document.blocks[0] {
+        Block::Paragraph(inlines) => assert!(matches!(
+            &inlines[0],
+            Inline::Image { source: ImageSource::Asset(AssetId(0)), .. }
+        )),
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn uppercase_cid_image_becomes_an_embedded_document_asset() {
+    let mhtml = mhtml_fixture(
+        r#"MIME-Version: 1.0
+Content-Type: multipart/related; type="text/html"; boundary="b"
+
+--b
+Content-Type: text/html
+
+<!doctype html><p><img alt="pixel" src="CID:image@id"></p>
+--b
+Content-Type: image/png
+Content-ID: <image@id>
+Content-Transfer-Encoding: base64
+
+AAECAw==
+--b--
+"#,
+    );
+    let document = to_document(&mhtml, Some(Format::Mhtml)).unwrap();
+    match &document.blocks[0] {
+        Block::Paragraph(inlines) => assert!(matches!(
+            &inlines[0],
+            Inline::Image { source: ImageSource::Asset(AssetId(0)), .. }
+        )),
+        other => panic!("expected paragraph, got {other:?}"),
+    }
 }
 
 #[test]
@@ -147,7 +314,7 @@ AAECAw==
 --b--
 "#,
     );
-    let document = to_document(&mhtml, None).unwrap();
+    let document = to_document(&mhtml, Some(Format::Mhtml)).unwrap();
     assert_eq!(document.assets.len(), 1);
     assert_eq!(document.assets[0].media_type, "image/png");
     assert_eq!(document.assets[0].bytes, [0, 1, 2, 3]);
@@ -181,7 +348,7 @@ AAECAw==
 --b--
 "#,
     );
-    let document = to_document(&mhtml, None).unwrap();
+    let document = to_document(&mhtml, Some(Format::Mhtml)).unwrap();
     assert_eq!(document.assets.len(), 1);
     match &document.blocks[0] {
         Block::Paragraph(inlines) => assert!(matches!(
