@@ -24,7 +24,7 @@ pub(crate) fn looks_like_mhtml(bytes: &[u8]) -> bool {
     };
     let compact: String = content_type.chars().filter(|c| !c.is_ascii_whitespace()).collect();
 
-    compact.starts_with("multipart/related") && snapshot
+    (compact == "multipart/related" || compact.starts_with("multipart/related;")) && snapshot
 }
 
 fn mime_header_block(bytes: &[u8]) -> &[u8] {
@@ -113,11 +113,12 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
         html_part.content_type().and_then(|content_type| content_type.attribute("charset"));
     let html = super::html::decode_html_with_charset(&html_bytes, declared_charset);
     let root_location = html_part.content_location();
+    let resource_base = html_resource_base(&html, root_location);
 
-    let resource_index = build_resource_index(&message.parts);
-    let (stylesheets, resource_base) =
-        collect_stylesheets_in_order(&html, &message.parts, &resource_index, root_location)?;
-    let (assets, image_assets) = collect_image_assets(&message.parts)?;
+    let resource_index = build_resource_index(&message.parts, resource_base.as_deref());
+    let stylesheets =
+        collect_stylesheets_in_order(&html, &message.parts, &resource_index, resource_base.as_deref())?;
+    let (assets, image_assets) = collect_image_assets(&message.parts, resource_base.as_deref())?;
     let ctx = MhtmlCtx { image_assets, resource_base };
 
     super::html::parse_text_with_context(&html, Some(&stylesheets), &ctx, assets)
@@ -144,10 +145,23 @@ fn transfer_decoded_part_bytes(
     }
 }
 
-fn build_resource_index(parts: &[mail_parser::MessagePart<'_>]) -> HashMap<String, usize> {
+fn html_resource_base(html: &str, root_location: Option<&str>) -> Option<String> {
+    let parsed = Html::parse_document(html);
+    let root = parsed.root_element();
+    root.descendent_elements()
+        .find(|element| element.value().name() == "base")
+        .and_then(|element| element.value().attr("href"))
+        .map(|href| resolve_resource_reference(root_location, href))
+        .or_else(|| root_location.map(canonical_reference))
+}
+
+fn build_resource_index(
+    parts: &[mail_parser::MessagePart<'_>],
+    resource_base: Option<&str>,
+) -> HashMap<String, usize> {
     let mut index = HashMap::new();
     for (part_index, part) in parts.iter().enumerate() {
-        for key in resource_keys(part) {
+        for key in resource_keys(part, resource_base) {
             index.entry(key).or_insert(part_index);
         }
     }
@@ -158,16 +172,10 @@ fn collect_stylesheets_in_order(
     html: &str,
     parts: &[mail_parser::MessagePart<'_>],
     resource_index: &HashMap<String, usize>,
-    root_location: Option<&str>,
-) -> Result<(Vec<String>, Option<String>), ConvertError> {
+    resource_base: Option<&str>,
+) -> Result<Vec<String>, ConvertError> {
     let parsed = Html::parse_document(html);
     let root = parsed.root_element();
-    let resource_base = root
-        .descendent_elements()
-        .find(|element| element.value().name() == "base")
-        .and_then(|element| element.value().attr("href"))
-        .map(|href| resolve_resource_reference(root_location, href))
-        .or_else(|| root_location.map(canonical_reference));
     let mut stylesheets = Vec::new();
 
     for element in root.descendent_elements() {
@@ -184,7 +192,7 @@ fn collect_stylesheets_in_order(
                 let Some(href) = element.value().attr("href") else {
                     continue;
                 };
-                let reference = resolve_resource_reference(resource_base.as_deref(), href);
+                let reference = resolve_resource_reference(resource_base, href);
                 let Some(&part_index) = resource_index.get(&reference) else {
                     continue;
                 };
@@ -211,11 +219,12 @@ fn collect_stylesheets_in_order(
         }
     }
 
-    Ok((stylesheets, resource_base))
+    Ok(stylesheets)
 }
 
 fn collect_image_assets(
     parts: &[mail_parser::MessagePart<'_>],
+    resource_base: Option<&str>,
 ) -> Result<(Vec<Asset>, HashMap<String, AssetId>), ConvertError> {
     let mut assets = Vec::new();
     let mut image_assets = HashMap::new();
@@ -264,7 +273,7 @@ fn collect_image_assets(
             origin_part,
             bytes: bytes.to_vec(),
         });
-        for key in resource_keys(part) {
+        for key in resource_keys(part, resource_base) {
             image_assets.entry(key).or_insert(id);
         }
     }
@@ -272,7 +281,10 @@ fn collect_image_assets(
     Ok((assets, image_assets))
 }
 
-fn resource_keys(part: &mail_parser::MessagePart<'_>) -> Vec<String> {
+fn resource_keys(
+    part: &mail_parser::MessagePart<'_>,
+    resource_base: Option<&str>,
+) -> Vec<String> {
     let mut keys = Vec::new();
     if let Some(content_id) = part.content_id() {
         let id = normalize_content_id(content_id);
@@ -282,7 +294,7 @@ fn resource_keys(part: &mail_parser::MessagePart<'_>) -> Vec<String> {
         }
     }
     if let Some(location) = part.content_location() {
-        let location = canonical_reference(location);
+        let location = resolve_resource_reference(resource_base, location);
         if !location.is_empty() && !keys.contains(&location) {
             keys.push(location);
         }
@@ -307,7 +319,7 @@ fn canonical_reference(value: &str) -> String {
 fn normalize_content_id(value: &str) -> String {
     let value = value.trim();
     let value = strip_prefix_ignore_ascii_case(value, "cid:").unwrap_or(value);
-    value.trim_matches(|c| matches!(c, '<' | '>')).to_string()
+    value.trim_matches(|c| matches!(c, '<' | '>')).to_ascii_lowercase()
 }
 
 fn resolve_resource_reference(base: Option<&str>, value: &str) -> String {
