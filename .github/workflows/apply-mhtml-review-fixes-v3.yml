@@ -1,0 +1,53 @@
+name: Apply MHTML review fixes v3
+
+on:
+  push:
+    branches: [verify/mhtml-cubic-review]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+      - name: Reuse deterministic patch with clippy correction
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          yaml = subprocess.check_output([
+              'git', 'show',
+              '0aadff07bc83a4b97da6a1d08809b96c98916359:.github/workflows/apply-mhtml-review-fixes-v2.yml'
+          ], text=True)
+          marker = '      - name: Patch restacked MHTML branch and verify\n'
+          start = yaml.index(marker) + len(marker)
+          run_marker = '        run: |\n'
+          start = yaml.index(run_marker, start) + len(run_marker)
+          lines = yaml[start:].splitlines()
+          script_lines = []
+          for line in lines:
+              if line.startswith('          '):
+                  script_lines.append(line[10:])
+              elif not line.strip():
+                  script_lines.append('')
+              else:
+                  break
+          script = '\n'.join(script_lines) + '\n'
+          old = 'Ok(is_absolute_uri(&reference).then(|| ImageSource::External(reference)))'
+          new = 'Ok(is_absolute_uri(&reference).then_some(ImageSource::External(reference)))'
+          if old not in script:
+              raise SystemExit('expected clippy expression not found in extracted patch')
+          script = script.replace(old, new, 1)
+          Path('/tmp/apply-mhtml-fixes.sh').write_text(script)
+          PY
+          bash /tmp/apply-mhtml-fixes.sh
