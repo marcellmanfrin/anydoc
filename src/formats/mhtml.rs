@@ -17,7 +17,8 @@ pub(crate) fn looks_like_mhtml(bytes: &[u8]) -> bool {
     let lower = unfolded.to_ascii_lowercase();
     let snapshot = lower.lines().any(|line| line.starts_with("snapshot-content-location:"));
 
-    let Some(content_type) = lower.lines().find_map(|line| line.strip_prefix("content-type:")) else {
+    let Some(content_type) = lower.lines().find_map(|line| line.strip_prefix("content-type:"))
+    else {
         return false;
     };
     let compact: String = content_type.chars().filter(|c| !c.is_ascii_whitespace()).collect();
@@ -74,9 +75,10 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
         });
     }
 
-    let message = MessageParser::new().with_mime_headers().parse(bytes).ok_or_else(|| {
-        ConvertError::malformed("MHTML MIME structure could not be parsed")
-    })?;
+    let message = MessageParser::new()
+        .with_mime_headers()
+        .parse(bytes)
+        .ok_or_else(|| ConvertError::malformed("MHTML MIME structure could not be parsed"))?;
 
     if !message.is_content_type("multipart", "related") {
         return Err(ConvertError::malformed("MHTML root is not multipart/related"));
