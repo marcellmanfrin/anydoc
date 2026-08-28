@@ -1,0 +1,22 @@
+name: Build Python artifact
+on:
+  push:
+    branches: [feature/html-support]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install maturin
+      - run: maturin build --release --locked --manifest-path python/Cargo.toml --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anydoc-python-wheel
+          path: dist/*.whl
