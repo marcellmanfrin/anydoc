@@ -1,0 +1,14 @@
+name: Verify HTML round 4 RED
+
+on:
+  push:
+    branches:
+      - verify/html-round4-red
+
+jobs:
+  html-red:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --test html_utf16_long_doctype
