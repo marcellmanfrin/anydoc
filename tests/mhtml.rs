@@ -457,3 +457,42 @@ AAECAw==
         other => panic!("expected paragraph, got {other:?}"),
     }
 }
+
+#[test]
+fn start_parameter_content_id_matching_is_case_insensitive() {
+    let mhtml = mhtml_fixture(
+        r#"MIME-Version: 1.0
+Content-Type: multipart/related; type="text/html"; start="<ROOT@ID>"; boundary="b"
+
+--b
+Content-Type: text/html
+Content-ID: <root@id>
+
+<p>right root</p>
+--b--
+"#,
+    );
+    assert_eq!(to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap(), "right root\n");
+}
+
+#[test]
+fn relative_part_content_location_resolves_against_html_base() {
+    let mhtml = mhtml_fixture(
+        r#"MIME-Version: 1.0
+Content-Type: multipart/related; type="text/html"; boundary="b"
+
+--b
+Content-Type: text/html; charset=utf-8
+Content-Location: https://example.test/docs/page.html
+
+<!doctype html><base href="https://cdn.example.test/assets/"><link rel="stylesheet" href="styles/site.css"><p class="strong">keep me</p>
+--b
+Content-Type: text/css; charset=utf-8
+Content-Location: styles/site.css
+
+.strong { font-weight: bold }
+--b--
+"#,
+    );
+    assert_eq!(to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap(), "**keep me**\n");
+}
