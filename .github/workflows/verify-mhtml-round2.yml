@@ -1,0 +1,17 @@
+name: Verify MHTML round 2 RED
+
+on:
+  push:
+    branches: [verify/mhtml-round2]
+
+permissions:
+  contents: read
+
+jobs:
+  regressions:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --test html --test mhtml

@@ -103,7 +103,7 @@ Content-Type: text/html; charset=iso-8859-2
 Content-Transfer-Encoding: quoted-printable
 Content-Location: https://example.test/page
 
-<!doctype html><p>=A3</p>
+<!doctype html><meta charset="utf-8"><p>=A3</p>
 --b--
 "#,
     );
@@ -350,6 +350,105 @@ AAECAw==
     );
     let document = to_document(&mhtml, Some(Format::Mhtml)).unwrap();
     assert_eq!(document.assets.len(), 1);
+    match &document.blocks[0] {
+        Block::Paragraph(inlines) => assert!(matches!(
+            &inlines[0],
+            Inline::Image { source: ImageSource::Asset(AssetId(0)), .. }
+        )),
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+
+#[test]
+fn mhtml_detection_requires_exact_related_media_type() {
+    let mhtml = mhtml_fixture(
+        r#"Snapshot-Content-Location: https://example.test/page
+MIME-Version: 1.0
+Content-Type: multipart/relatedness; boundary="b"
+
+--b
+Content-Type: text/html
+
+<!doctype html><p>Hello</p>
+--b--
+"#,
+    );
+    assert_eq!(Format::from_bytes(&mhtml), None);
+}
+
+#[test]
+fn relative_css_part_content_location_resolves_against_root() {
+    let mhtml = mhtml_fixture(
+        r#"MIME-Version: 1.0
+Content-Type: multipart/related; type="text/html"; boundary="b"
+
+--b
+Content-Type: text/html; charset=utf-8
+Content-Location: https://example.test/docs/page.html
+
+<!doctype html><link rel="stylesheet" href="styles/site.css"><p class="strong">keep me</p>
+--b
+Content-Type: text/css; charset=utf-8
+Content-Location: styles/site.css
+
+.strong { font-weight: bold }
+--b--
+"#,
+    );
+    assert_eq!(to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap(), "**keep me**\n");
+}
+
+#[test]
+fn relative_image_part_content_location_resolves_against_root() {
+    let mhtml = mhtml_fixture(
+        r#"MIME-Version: 1.0
+Content-Type: multipart/related; type="text/html"; boundary="b"
+
+--b
+Content-Type: text/html; charset=utf-8
+Content-Location: https://example.test/docs/page.html
+
+<!doctype html><p><img alt="pixel" src="images/pixel.png"></p>
+--b
+Content-Type: image/png
+Content-Location: images/pixel.png
+Content-Transfer-Encoding: base64
+
+AAECAw==
+--b--
+"#,
+    );
+    let document = to_document(&mhtml, Some(Format::Mhtml)).unwrap();
+    match &document.blocks[0] {
+        Block::Paragraph(inlines) => assert!(matches!(
+            &inlines[0],
+            Inline::Image { source: ImageSource::Asset(AssetId(0)), .. }
+        )),
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn cid_identifier_matching_is_case_insensitive() {
+    let mhtml = mhtml_fixture(
+        r#"MIME-Version: 1.0
+Content-Type: multipart/related; type="text/html"; boundary="b"
+
+--b
+Content-Type: text/html
+
+<!doctype html><p><img alt="pixel" src="cid:IMAGE@ID"></p>
+--b
+Content-Type: image/png
+Content-ID: <image@id>
+Content-Transfer-Encoding: base64
+
+AAECAw==
+--b--
+"#,
+    );
+    let document = to_document(&mhtml, Some(Format::Mhtml)).unwrap();
     match &document.blocks[0] {
         Block::Paragraph(inlines) => assert!(matches!(
             &inlines[0],
