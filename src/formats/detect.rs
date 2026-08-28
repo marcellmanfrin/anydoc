@@ -66,11 +66,7 @@ fn looks_like_html(bytes: &[u8]) -> bool {
 fn looks_like_utf16_html(bytes: &[u8], little_endian: bool) -> bool {
     let (pairs, _) = bytes.as_chunks::<2>();
     let mut units = pairs.iter().map(|pair| {
-        if little_endian {
-            u16::from_le_bytes(*pair)
-        } else {
-            u16::from_be_bytes(*pair)
-        }
+        if little_endian { u16::from_le_bytes(*pair) } else { u16::from_be_bytes(*pair) }
     });
     let mut prefix = Vec::with_capacity(64);
     if let Some(first) =

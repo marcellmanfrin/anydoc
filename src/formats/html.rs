@@ -221,7 +221,8 @@ fn close_implied_before_start(open: &mut Vec<LocalName>, name: &str) {
         "td" | "th" => &["td", "th"][..],
         _ => return,
     };
-    if let Some(position) = open.iter().rposition(|candidate| implied.contains(&candidate.as_ref())) {
+    if let Some(position) = open.iter().rposition(|candidate| implied.contains(&candidate.as_ref()))
+    {
         open.truncate(position);
     }
 }
