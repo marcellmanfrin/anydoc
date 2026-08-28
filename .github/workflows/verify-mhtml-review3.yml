@@ -28,11 +28,11 @@ jobs:
       - name: Apply minimal MHTML parse reuse refactor
         run: |
           sed -i '/let html = super::html::decode_html_with_charset/a\    let parsed_html = Html::parse_document(&html);' src/formats/mhtml.rs
-          sed -i 's/html_resource_base(&html, root_location)/html_resource_base(&parsed_html, root_location)/' src/formats/mhtml.rs
-          sed -i '0,/        &html,/s//        &parsed_html,/' src/formats/mhtml.rs
-          sed -i 's/fn html_resource_base(html: &str,/fn html_resource_base(parsed: &Html,/' src/formats/mhtml.rs
+          sed -i 's/html_resource_base(&html, root_location)/html_resource_base(\&parsed_html, root_location)/' src/formats/mhtml.rs
+          sed -i '0,/        &html,/s//        \&parsed_html,/' src/formats/mhtml.rs
+          sed -i 's/fn html_resource_base(html: &str,/fn html_resource_base(parsed: \&Html,/' src/formats/mhtml.rs
           sed -i '/fn html_resource_base(parsed: &Html,/{n;/let parsed = Html::parse_document(html);/d;}' src/formats/mhtml.rs
-          sed -i 's/    html: &str,/    parsed: &Html,/' src/formats/mhtml.rs
+          sed -i 's/    html: &str,/    parsed: \&Html,/' src/formats/mhtml.rs
           sed -i '/fn collect_stylesheets_in_order(/,/let mut stylesheets = Vec::new();{/ { /let parsed = Html::parse_document(html);/d; }' src/formats/mhtml.rs
           cargo fmt --all
           git diff --check
