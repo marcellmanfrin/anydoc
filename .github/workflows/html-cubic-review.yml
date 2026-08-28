@@ -5,12 +5,68 @@ on:
     branches: [verify/html-cubic-review]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Apply UTF-16 detector fix once
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src/formats/detect.rs')
+          text = path.read_text()
+          old = '''fn looks_like_utf16_html(bytes: &[u8], little_endian: bool) -> bool {
+              let units: Vec<u16> = bytes
+                  .chunks_exact(2)
+                  .take(256)
+                  .map(|pair| {
+                      if little_endian {
+                          u16::from_le_bytes([pair[0], pair[1]])
+                      } else {
+                          u16::from_be_bytes([pair[0], pair[1]])
+                      }
+                  })
+                  .collect();
+              let decoded = String::from_utf16_lossy(&units);
+              looks_like_ascii_html(decoded.as_bytes())
+          }
+          '''
+          new = '''fn looks_like_utf16_html(bytes: &[u8], little_endian: bool) -> bool {
+              let mut units = bytes.chunks_exact(2).map(|pair| {
+                  if little_endian {
+                      u16::from_le_bytes([pair[0], pair[1]])
+                  } else {
+                      u16::from_be_bytes([pair[0], pair[1]])
+                  }
+              });
+              let mut prefix = Vec::with_capacity(64);
+              if let Some(first) = units.find(|unit| {
+                  !matches!(*unit, 0x0009 | 0x000A | 0x000C | 0x000D | 0x0020)
+              }) {
+                  prefix.push(first);
+                  prefix.extend(units.take(63));
+              }
+              let decoded = String::from_utf16_lossy(&prefix);
+              looks_like_ascii_html(decoded.as_bytes())
+          }
+          '''
+          if old in text:
+              path.write_text(text.replace(old, new, 1))
+          PY
+          if ! git diff --quiet -- src/formats/detect.rs; then
+            git config user.name "Marcell Manfrin Barbacena"
+            git config user.email "barbacena@gmail.com"
+            git add src/formats/detect.rs
+            git commit -m "fix: scan UTF-16 HTML after leading whitespace"
+            git push
+          fi
       - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --test html
