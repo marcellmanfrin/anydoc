@@ -33,7 +33,7 @@ jobs:
           mkdir -p /tmp/mhtml-clean
           files=(
             Cargo.toml Cargo.lock
-            node/cli.js node/index.d.ts node/mhtml.test.mjs node/src/lib.rs
+            node/cli.js node/mhtml.test.mjs node/src/lib.rs
             python/anydoc/_anydoc.pyi python/src/lib.rs python/tests/test_mhtml.py
             src/formats/html.rs src/formats/mhtml.rs src/formats/mod.rs src/lib.rs
             tests/mhtml.rs tests/mhtml_charset.rs
@@ -79,8 +79,13 @@ jobs:
       - name: Node tests
         working-directory: node
         run: npm test
-      - name: Generated Node bindings are current
-        run: git diff --exit-code -- node/index.js node/index.d.ts
+      - name: Generated Node declarations are deterministic
+        run: |
+          git diff --exit-code -- node/index.js
+          cp node/index.d.ts /tmp/node-index.d.ts
+          (cd node && npm run build)
+          cmp /tmp/node-index.d.ts node/index.d.ts
+          git diff --exit-code -- node/index.js
 
       - name: Install wasm-pack
         run: >
