@@ -2,7 +2,7 @@
 //! semantic HTML -> document-model frontend used by EPUB.
 
 use crate::error::ConvertError;
-use crate::model::{AnchorId, Document, ImageSource, LinkTarget};
+use crate::model::{AnchorId, Asset, Document, ImageSource, LinkTarget};
 use crate::package::limits;
 use crate::package::xml::{Attr, Element, Node};
 use crate::shared::html::{HtmlCtx, Stylesheet};
@@ -29,12 +29,24 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
     }
 
     let text = decode_html(bytes);
-    let parsed = Html::parse_document(&text);
+    parse_text_with_context(&text, &[], &StandaloneCtx, Vec::new())
+}
+
+pub(crate) fn parse_text_with_context(
+    text: &str,
+    extra_css: &[String],
+    ctx: &dyn HtmlCtx,
+    assets: Vec<Asset>,
+) -> Result<Document, ConvertError> {
+    let parsed = Html::parse_document(text);
     let root = parsed.root_element();
 
     let mut css = Stylesheet::default();
     for style in root.descendent_elements().filter(|e| e.value().name() == "style") {
         css.add(&style.text().collect::<String>());
+    }
+    for stylesheet in extra_css {
+        css.add(stylesheet);
     }
 
     let body = root
@@ -44,9 +56,9 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
 
     let mut node_count = 0usize;
     let body = adapt_element(body, 1, &mut node_count)?;
-    let blocks = crate::shared::html::to_blocks(&body, &css, &StandaloneCtx)?;
+    let blocks = crate::shared::html::to_blocks(&body, &css, ctx)?;
 
-    Ok(Document { blocks, ..Document::default() })
+    Ok(Document { blocks, assets, ..Document::default() })
 }
 
 fn decode_html(bytes: &[u8]) -> String {
