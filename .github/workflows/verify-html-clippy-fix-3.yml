@@ -1,0 +1,21 @@
+name: Verify isolated HTML corpus helper
+on:
+  push:
+    branches: [verify/html-clippy-fix-3]
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --test html
+      - run: cargo test --locked --test html_corpus
+      - run: cargo test --locked --test snapshots corpus -- --exact
+      - run: cargo test --locked --test snapshots fixtures_detect_from_content -- --exact
+      - run: cargo test --locked --test robustness --no-run
+      - run: git diff --exit-code -- tests/snapshots
