@@ -1,0 +1,80 @@
+name: review-followup-full
+on:
+  push:
+    branches:
+      - review/mhtml-followup-red
+jobs:
+  full:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout exact functional candidate
+        run: git checkout --detach 238a1e53ba66700a0d538cf39ebddffb34895dd7
+      - name: Specific HTML and MHTML validation
+        run: |
+          cargo test --locked --test review_followup
+          cargo test --locked --test html
+          cargo test --locked --test html_corpus
+          cargo test --locked --test html_list
+          cargo test --locked --test mhtml
+          cargo test --locked --test mhtml_charset
+          cargo test --locked --test mhtml_corpus
+      - name: Rust full gate
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --locked
+      - name: Node full gate
+        working-directory: node
+        run: |
+          npm ci
+          npm run build
+          npm test
+          git diff --exit-code -- index.js index.d.ts
+      - name: WASM full gate
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo clippy -p anydoc-wasm --target wasm32-unknown-unknown -- -D warnings
+          curl -sSfL https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.15.0/wasm-pack-v0.15.0-x86_64-unknown-linux-musl.tar.gz | tar xz --strip-components=1 -C /usr/local/bin wasm-pack-v0.15.0-x86_64-unknown-linux-musl/wasm-pack
+          wasm-pack build wasm --release --target web --scope firecrawl
+          node --test wasm/test.mjs
+      - name: Python full gate
+        run: |
+          pip install maturin
+          maturin build --release --locked --manifest-path python/Cargo.toml --out dist
+          pip install --force-reinstall --no-index --find-links dist firecrawl-anydoc
+          python - <<'PY'
+          import anydoc
+          print(anydoc.__file__)
+          assert '/site-packages/' in anydoc.__file__
+          PY
+          python -m unittest discover -s python/tests
+      - name: Real MHTML fixture
+        run: |
+          git fetch origin verify/mhtml-review3-candidate
+          : > /tmp/f.b64
+          for p in .ci-fixture/mhtml.xz.b64.00 .ci-fixture/mhtml.xz.b64.01 .ci-fixture/mhtml.xz.b64.03 .ci-fixture/mhtml.xz.b64.05 .ci-fixture/mhtml.xz.b64.07 .ci-fixture/mhtml.xz.b64.09 .ci-fixture/mhtml.xz.b64.11; do git show origin/verify/mhtml-review3-candidate:$p >> /tmp/f.b64; done
+          base64 -d /tmp/f.b64 > /tmp/f.xz
+          xz -dc /tmp/f.xz > /tmp/f.mhtml
+          test "$(stat -c%s /tmp/f.mhtml)" = 505883
+          echo "387c6f2d7223da224a8f55962b97eac947734c97fc84888e1e5619e93745837c  /tmp/f.mhtml" | sha256sum -c -
+          python - <<'PY'
+          import anydoc, hashlib
+          raw=open('/tmp/f.mhtml','rb').read()
+          assert anydoc.format_from_bytes(raw)=='mhtml'
+          out=anydoc.to_markdown_bytes(raw)
+          data=out.encode() if isinstance(out,str) else out
+          text=data.decode()
+          assert 'TRIBUNAL REGIONAL ELEITORAL DA PARAÍBA' in text
+          assert all(x not in text for x in ['�','Ã','Â'])
+          print(len(data), hashlib.sha256(data).hexdigest())
+          assert len(data)==78154
+          assert hashlib.sha256(data).hexdigest()=='f6f75cec7bc06afe038bd89cd7967e5af358ec3562553f5bfc5c47c0299eb80c'
+          PY
+      - name: Confirm exact candidate identity
+        run: |
+          test "$(git rev-parse HEAD)" = "238a1e53ba66700a0d538cf39ebddffb34895dd7"
+          git diff --exit-code
