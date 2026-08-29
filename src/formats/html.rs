@@ -527,4 +527,22 @@ mod tests {
             None
         );
     }
+    #[test]
+    fn nested_anchor_repair_preserves_structural_depth_in_preflight() {
+        let segment = limits::MAX_XML_DEPTH / 2;
+        let mut html = String::from("<!doctype html><a href=\"#outer\">");
+        for _ in 0..segment {
+            html.push_str("<div>");
+        }
+        html.push_str("<a href=\"#inner\">");
+        for _ in 0..segment {
+            html.push_str("<div>");
+        }
+
+        assert!(matches!(
+            preflight_html_complexity(&html),
+            Err(ConvertError::ResourceLimit { limit: "max_xml_depth", .. })
+        ));
+    }
+
 }
