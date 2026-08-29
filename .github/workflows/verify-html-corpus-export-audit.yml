@@ -20,14 +20,14 @@ jobs:
       - name: Export selected corpus documents to HTML
         run: |
           set -euxo pipefail
-          mkdir -p out
-          soffice --headless --convert-to html --outdir out tests/fixtures/docx/text.docx
-          soffice --headless --convert-to html --outdir out tests/fixtures/docx/handmade-numbering.docx
-          soffice --headless --convert-to html --outdir out tests/fixtures/odt/text.odt
-          soffice --headless --convert-to html --outdir out tests/fixtures/xlsx/handmade-merged.xlsx
-          find out -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
-          sha256sum out/* | sort
-          for html in out/*.html; do
+          mkdir -p out/docx-text out/docx-numbering out/odt-text out/xlsx-merged
+          soffice --headless --convert-to html --outdir out/docx-text tests/fixtures/docx/text.docx
+          soffice --headless --convert-to html --outdir out/docx-numbering tests/fixtures/docx/handmade-numbering.docx
+          soffice --headless --convert-to html --outdir out/odt-text tests/fixtures/odt/text.odt
+          soffice --headless --convert-to html --outdir out/xlsx-merged tests/fixtures/xlsx/handmade-merged.xlsx
+          find out -type f -name '*.html' -printf '%p %s bytes\n' | sort
+          find out -type f -name '*.html' -print0 | sort -z | xargs -0 sha256sum
+          for html in out/*/*.html; do
             echo "=== $html ==="
             printf 'headings='; (grep -Eio '<h[1-6][ >]' "$html" || true) | wc -l
             printf 'tables='; (grep -Eio '<table[ >]' "$html" || true) | wc -l
@@ -35,6 +35,10 @@ jobs:
             printf 'lists='; (grep -Eio '<(ul|ol)[ >]' "$html" || true) | wc -l
             printf 'colspan='; (grep -Eio 'colspan=' "$html" || true) | wc -l
             printf 'rowspan='; (grep -Eio 'rowspan=' "$html" || true) | wc -l
+            echo "BASE64-BEGIN $html"
+            base64 -w0 "$html"
+            echo
+            echo "BASE64-END $html"
           done
       - uses: actions/upload-artifact@v4
         with:
