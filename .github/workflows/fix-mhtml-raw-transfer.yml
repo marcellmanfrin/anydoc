@@ -1,0 +1,120 @@
+name: fix-mhtml-raw-transfer
+
+on:
+  push:
+    branches:
+      - verify/mhtml-cubic-raw-transfer-fix
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: review/mhtml-followup-candidate2
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Restore raw transfer-decoded HTML bytes with bounds
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/formats/mhtml.rs')
+          text = p.read_text()
+          old = 'use mail_parser::{MessageParser, MessagePart, MimeHeaders};'
+          new = '''use mail_parser::decoders::{base64::base64_decode, quoted_printable::quoted_printable_decode};
+          use mail_parser::{Encoding, Message, MessageParser, MessagePart, MimeHeaders};'''.replace('          ', '')
+          if old not in text:
+              raise SystemExit('import marker not found')
+          text = text.replace(old, new, 1)
+          old = '    let html_bytes = decoded_part_bytes(html_part, "HTML root")?;'
+          new = '    let html_bytes = transfer_decoded_part_bytes(&message, html_part, "HTML root")?;'
+          if old not in text:
+              raise SystemExit('html bytes marker not found')
+          text = text.replace(old, new, 1)
+          start = text.find('fn decoded_part_bytes(')
+          end = text.find('fn html_resource_base(', start)
+          if start < 0 or end < 0:
+              raise SystemExit('decoded helper markers not found')
+          helper = r'''fn transfer_decoded_part_bytes(
+              message: &Message<'_>,
+              part: &MessagePart<'_>,
+              label: &str,
+          ) -> Result<Vec<u8>, ConvertError> {
+              let raw = message
+                  .raw_message
+                  .get(part.offset_body as usize..part.offset_end as usize)
+                  .ok_or_else(|| ConvertError::malformed(format!("MHTML {label} byte range is invalid")))?;
+
+              let decoded = match part.encoding {
+                  Encoding::None => {
+                      enforce_part_size(raw.len(), label, "body")?;
+                      raw.to_vec()
+                  }
+                  Encoding::QuotedPrintable => {
+                      enforce_part_size(raw.len(), label, "quoted-printable encoded body")?;
+                      quoted_printable_decode(raw).ok_or_else(|| {
+                          ConvertError::malformed(format!(
+                              "MHTML {label} quoted-printable body is invalid"
+                          ))
+                      })?
+                  }
+                  Encoding::Base64 => {
+                      let upper_bound = base64_decoded_upper_bound(raw);
+                      if upper_bound > limits::MAX_ENTRY_BYTES {
+                          return Err(ConvertError::ResourceLimit {
+                              limit: "max_entry_bytes",
+                              detail: format!(
+                                  "MHTML {label} base64 body can decode to at most {upper_bound} bytes; maximum is {}",
+                                  limits::MAX_ENTRY_BYTES
+                              ),
+                          });
+                      }
+                      base64_decode(raw).ok_or_else(|| {
+                          ConvertError::malformed(format!("MHTML {label} base64 body is invalid"))
+                      })?
+                  }
+              };
+
+              enforce_part_size(decoded.len(), label, "decoded body")?;
+              Ok(decoded)
+          }
+
+          fn enforce_part_size(size: usize, label: &str, kind: &str) -> Result<(), ConvertError> {
+              if size as u64 > limits::MAX_ENTRY_BYTES {
+                  return Err(ConvertError::ResourceLimit {
+                      limit: "max_entry_bytes",
+                      detail: format!(
+                          "MHTML {label} {kind} is {size} bytes; maximum is {}",
+                          limits::MAX_ENTRY_BYTES
+                      ),
+                  });
+              }
+              Ok(())
+          }
+
+          fn base64_decoded_upper_bound(raw: &[u8]) -> u64 {
+              let symbols = raw
+                  .iter()
+                  .filter(|byte| !byte.is_ascii_whitespace())
+                  .count() as u64;
+              symbols.saturating_add(3).saturating_div(4).saturating_mul(3)
+          }
+
+          '''
+          text = text[:start] + helper + text[end:]
+          p.write_text(text)
+          PY
+          cargo fmt --all
+      - name: Commit functional fix
+        run: |
+          git config user.name "AnyDoc CI"
+          git config user.email "ci@example.invalid"
+          git add src/formats/mhtml.rs
+          git diff --cached --check
+          git commit -m "fix: preserve raw MHTML charset bytes within limits"
+          git push origin HEAD:review/mhtml-followup-candidate2
