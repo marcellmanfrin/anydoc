@@ -1,0 +1,20 @@
+name: verify-mhtml-cubic-red2
+
+on:
+  push:
+    branches:
+      - review/mhtml-cubic-red2
+
+permissions:
+  contents: read
+
+jobs:
+  red:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 38b775d438c2e6021e9ca8698a90f1fc709b7dee
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run RTF detection regression
+        run: cargo test --test format_detection -- --nocapture
