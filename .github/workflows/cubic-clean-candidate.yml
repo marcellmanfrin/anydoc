@@ -1,0 +1,42 @@
+name: cubic-clean-candidate
+
+on:
+  push:
+    branches: [review/mhtml-cubic-round5-ci]
+
+permissions:
+  contents: write
+
+jobs:
+  candidate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: review/mhtml-cubic-round5-candidate
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply validated net diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin review/mhtml-cubic-round5
+          git diff --binary 32f02126a1dbca26f58de41d81e4e0ce2b096066 origin/review/mhtml-cubic-round5 -- src/formats/html.rs tests/html.rs tests/mhtml.rs tests/review_followup.rs | git apply
+          cargo fmt --all -- --check
+          git diff --check
+          git config user.name "Marcell Manfrin Barbacena"
+          git config user.email "barbacena@gmail.com"
+          git add src/formats/html.rs tests/html.rs tests/mhtml.rs tests/review_followup.rs
+          git commit -m "fix: preserve structural depth across anchor recovery"
+          echo "candidate_sha=$(git rev-parse HEAD)"
+      - name: Verify focused regressions on exact candidate
+        run: |
+          cargo test --locked --test html repeated_unclosed_anchors_do_not_trigger_depth_limit -- --exact
+          cargo test --locked --test html intervening_blocks_between_unclosed_anchors_still_hit_preflight_depth_limit -- --exact
+          cargo test --locked --test mhtml bare_relative_image_does_not_match_content_id -- --exact
+          cargo test --locked --test mhtml content_location_fragment_is_ignored_for_resource_lookup -- --exact
+          git diff --exit-code
+      - name: Push clean candidate
+        run: git push origin HEAD:review/mhtml-cubic-round5-candidate
