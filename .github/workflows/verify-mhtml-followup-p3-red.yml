@@ -1,0 +1,16 @@
+name: verify-mhtml-followup-p3-red
+on:
+  push:
+    branches: [review/mhtml-followup-p3]
+permissions:
+  contents: read
+jobs:
+  red:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: eb26791e71e01e097718b2e563ea1b14933915c8
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run nested anchor regression
+        run: cargo test nested_anchor_repair_preserves_structural_depth_in_preflight --lib -- --exact --nocapture
