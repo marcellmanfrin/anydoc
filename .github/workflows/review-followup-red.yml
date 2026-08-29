@@ -1,0 +1,13 @@
+name: review-followup-red
+on:
+  push:
+    branches:
+      - review/mhtml-followup-red
+jobs:
+  red:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run review regressions
+        run: cargo test --locked --test review_followup -- --nocapture
