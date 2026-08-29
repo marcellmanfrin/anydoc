@@ -1,0 +1,27 @@
+name: Generate HTML corpus snapshots
+on:
+  push:
+    branches: [verify/html-snapshot-generate]
+jobs:
+  snapshots:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate snapshots
+        env:
+          INSTA_UPDATE: always
+        run: cargo test --locked --test snapshots corpus -- --exact
+      - name: Verify content detection
+        run: cargo test --locked --test snapshots fixtures_detect_from_content -- --exact
+      - name: Print HTML snapshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in tests/snapshots/snapshots__html__*.snap; do
+            echo "SNAPSHOT-BEGIN $f"
+            base64 -w0 "$f"
+            echo
+            echo "SNAPSHOT-END $f"
+          done
