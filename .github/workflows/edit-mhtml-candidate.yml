@@ -19,6 +19,15 @@ jobs:
       - name: Fetch editor script
         run: |
           git show origin/review/mhtml-candidate-editor:.github/scripts/edit_mhtml_candidate.py > /tmp/edit_mhtml_candidate.py
+      - name: Preserve Rust source escapes in charset replacement
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('/tmp/edit_mhtml_candidate.py')
+          text = path.read_text()
+          text = text.replace("    '''<!doctype html><meta http-equiv=3D", "    r'''<!doctype html><meta http-equiv=3D")
+          path.write_text(text)
+          PY
       - name: Apply reviewed candidate changes
         run: python /tmp/edit_mhtml_candidate.py
       - name: Commit candidate
