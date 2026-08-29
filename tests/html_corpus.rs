@@ -102,4 +102,8 @@ fn libreoffice_xlsx_merged_table_preserves_real_export_content() {
             .unwrap_or_else(|| panic!("HTML Markdown missing {value:?} in expected cell order"));
         offset += relative + value.len();
     }
+    assert!(
+        html.contains("| --- | --- | --- |"),
+        "expected the merged export to retain its three-column table structure"
+    );
 }

@@ -142,7 +142,14 @@ fn preflight_base64_decoder_allocations_with_limit(
     let Some(boundary) = mime_boundary_from_headers(headers) else {
         return Ok(());
     };
-    preflight_multipart_base64(bytes, body_start, bytes.len(), &boundary, max_entry_bytes)
+    preflight_multipart_base64(
+        bytes,
+        body_start,
+        bytes.len(),
+        &boundary,
+        max_entry_bytes,
+        1,
+    )
 }
 
 fn preflight_multipart_base64(
@@ -151,6 +158,7 @@ fn preflight_multipart_base64(
     end: usize,
     boundary: &[u8],
     max_entry_bytes: u64,
+    depth: usize,
 ) -> Result<(), ConvertError> {
     let mut marker = Vec::with_capacity(boundary.len() + 2);
     marker.extend_from_slice(b"--");
@@ -182,12 +190,23 @@ fn preflight_multipart_base64(
         let next_parent =
             find_bytes(&bytes[body_start..end], &marker).map_or(end, |next| body_start + next);
         if let Some(nested_boundary) = mime_boundary_from_headers(headers) {
+            let nested_depth = depth.saturating_add(1);
+            if nested_depth > limits::MAX_MIME_DEPTH {
+                return Err(ConvertError::ResourceLimit {
+                    limit: "max_mime_depth",
+                    detail: format!(
+                        "MHTML MIME nesting depth {nested_depth} exceeds maximum of {}",
+                        limits::MAX_MIME_DEPTH
+                    ),
+                });
+            }
             preflight_multipart_base64(
                 bytes,
                 body_start,
                 next_parent,
                 &nested_boundary,
                 max_entry_bytes,
+                nested_depth,
             )?;
         }
         offset = next_parent;
