@@ -1,0 +1,57 @@
+name: Inspect SEI validation fixture page
+on:
+  push:
+    branches: [verify/sei-fixture-page-inspect]
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    env:
+      VALIDATION: ${{ secrets.ANYDOC_VALIDATION_FIXTURE_URL }}
+    steps:
+      - name: Inspect page without exposing secret URL
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, html, os, re, urllib.parse, urllib.request
+          base = os.environ['VALIDATION']
+          data = urllib.request.urlopen(base, timeout=20).read()
+          text = data.decode('utf-8', errors='replace')
+          title = re.search(r'<title[^>]*>(.*?)</title>', text, re.I | re.S)
+          title_text = re.sub(r'\s+', ' ', html.unescape(title.group(1))).strip()[:200] if title else ''
+          print('title=', title_text)
+          for label, needle in [
+              ('has_2479872', '2479872'),
+              ('has_original_name', 'Contratação_ ETP de TIC'),
+              ('has_expected_court', 'TRIBUNAL REGIONAL ELEITORAL DA PARAÍBA'),
+              ('has_multipart_related', 'multipart/related'),
+              ('has_mime_version', 'MIME-Version:'),
+              ('has_mhtml_text', 'mhtml'),
+          ]:
+              print(f'{label}={needle.lower() in text.lower()}')
+          hrefs = [html.unescape(x) for x in re.findall(r'''href\s*=\s*["']([^"']+)["']''', text, re.I)]
+          raw_urls = [html.unescape(x) for x in re.findall(r'''https?://[^\s"'<>]+''', text, re.I)]
+          candidates = []
+          for x in hrefs + raw_urls:
+              low = x.lower()
+              if any(k in low for k in ('.mhtml', '.mht', '2479872', 'download', 'attachment')):
+                  u = urllib.parse.urljoin(base, x)
+                  if u not in candidates:
+                      candidates.append(u)
+          print('href_count=', len(hrefs))
+          print('candidate_count=', len(candidates))
+          expected = '387c6f2d7223da224a8f55962b97eac947734c97fc84888e1e5619e93745837c'
+          recovered = False
+          for i, u in enumerate(candidates[:60]):
+              try:
+                  payload = urllib.request.urlopen(u, timeout=15).read()
+              except Exception:
+                  continue
+              digest = hashlib.sha256(payload).hexdigest()
+              print(f'candidate_{i}_bytes={len(payload)} sha256={digest}')
+              if digest == expected and len(payload) == 505883:
+                  open('/tmp/recovered.mhtml', 'wb').write(payload)
+                  print(f'recovered_candidate={i}')
+                  recovered = True
+                  break
+          print('recovered=', recovered)
+          PY
