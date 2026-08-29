@@ -1,0 +1,88 @@
+name: Verify real MHTML fixture
+
+on:
+  push:
+    branches:
+      - verify/mhtml-review3-candidate
+
+jobs:
+  real-mhtml:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fixture infrastructure
+        uses: actions/checkout@v4
+
+      - name: Reconstruct and verify original fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .ci-fixture/mhtml.xz.b64.* | base64 -d | xz -d > /tmp/real.mhtml
+          test "$(wc -c < /tmp/real.mhtml)" = "505883"
+          echo "387c6f2d7223da224a8f55962b97eac947734c97fc84888e1e5619e93745837c  /tmp/real.mhtml" | sha256sum -c -
+
+      - name: Checkout exact validated candidate
+        uses: actions/checkout@v4
+        with:
+          ref: f23fdfdddf6ec2de475c4727bb2455ec8b11a956
+          clean: true
+
+      - name: Confirm exact code SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "f23fdfdddf6ec2de475c4727bb2455ec8b11a956"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Maturin
+        run: pip install 'maturin>=1.7,<2'
+
+      - name: Build and install release wheel from lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          maturin build --release --locked --manifest-path python/Cargo.toml --out dist
+          pip install --no-index --find-links dist firecrawl-anydoc
+
+      - name: Convert real MHTML directly and validate output
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import anydoc
+
+          source = Path('/tmp/real.mhtml')
+          data = source.read_bytes()
+          detected = anydoc.format_from_bytes(data)
+          assert detected == 'mhtml', detected
+          markdown = anydoc.to_markdown(source)
+          raw = markdown.encode('utf-8')
+          digest = hashlib.sha256(raw).hexdigest()
+          print('detected:', detected)
+          print('output_bytes:', len(raw))
+          print('output_sha256:', digest)
+          print('replacement_count:', markdown.count('\ufffd'))
+          print('A_tilde_count:', markdown.count('Ã'))
+          print('A_circ_count:', markdown.count('Â'))
+          assert 'TRE-PB' in markdown
+          assert 'ETP' in markdown
+          assert any(token in markdown for token in ('Contratação', 'Técnico', 'Aquisição', 'Informação'))
+          assert '\ufffd' not in markdown
+          assert 'Ã' not in markdown
+          assert 'Â' not in markdown
+          assert len(raw) == 78154, len(raw)
+          assert digest == 'f6f75cec7bc06afe038bd89cd7967e5af358ec3562553f5bfc5c47c0299eb80c', digest
+          Path('/tmp/real-output.md').write_bytes(raw)
+          PY
+
+      - name: Reconfirm code SHA after validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "f23fdfdddf6ec2de475c4727bb2455ec8b11a956"
