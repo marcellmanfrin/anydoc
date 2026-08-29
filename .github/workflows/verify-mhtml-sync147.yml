@@ -5,25 +5,260 @@ on:
 permissions:
   contents: write
 jobs:
-  merge-diagnostic:
+  candidate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Fetch canonical HTML head
-        run: git fetch origin fbe5339f2eb23a64f84007bd75c873c70cc9b032
-      - name: Diagnose semantic merge
+      - name: Build semantic sync candidate
         shell: bash
         run: |
-          set +e
+          set -euo pipefail
           git config user.name "anydoc-ci"
           git config user.email "anydoc-ci@users.noreply.github.com"
+          git checkout --detach f23fdfdddf6ec2de475c4727bb2455ec8b11a956
+          git fetch origin fbe5339f2eb23a64f84007bd75c873c70cc9b032
+          set +e
           git merge --no-commit --no-ff fbe5339f2eb23a64f84007bd75c873c70cc9b032
           rc=$?
-          echo "merge_rc=$rc"
-          echo "=== unmerged ==="
-          git diff --name-only --diff-filter=U || true
-          echo "=== status ==="
-          git status --short
-          exit $rc
+          set -e
+          test "$rc" -eq 1
+          test "$(git diff --name-only --diff-filter=U | sort | tr '\n' ' ')" = "src/formats/detect.rs src/formats/html.rs tests/html.rs "
+          git checkout --theirs src/formats/detect.rs src/formats/html.rs tests/html.rs
+          git add src/formats/detect.rs src/formats/html.rs tests/html.rs Cargo.toml
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/formats/html.rs')
+          s=p.read_text()
+          s=s.replace('use crate::model::{AnchorId, Document, ImageSource, LinkTarget};','use crate::model::{AnchorId, Asset, Document, ImageSource, LinkTarget};')
+          old='''    let text = decode_html(bytes);\n    preflight_html_complexity(&text)?;\n\n    let parsed = Html::parse_document(&text);'''
+          new='''    let text = decode_html(bytes);\n    parse_text_with_context(&text, None, &StandaloneCtx, Vec::new())\n}\n\npub(crate) fn parse_text_with_context(\n    text: &str,\n    ordered_stylesheets: Option<&[String]>,\n    ctx: &dyn HtmlCtx,\n    assets: Vec<Asset>,\n) -> Result<Document, ConvertError> {\n    preflight_html_complexity(text)?;\n\n    let parsed = Html::parse_document(text);'''
+          assert old in s
+          s=s.replace(old,new,1)
+          old='''    let mut css = Stylesheet::default();\n    for style in root.descendent_elements().filter(|e| e.value().name() == "style") {\n        css.add(&style.text().collect::<String>());\n    }'''
+          new='''    let mut css = Stylesheet::default();\n    if let Some(stylesheets) = ordered_stylesheets {\n        for stylesheet in stylesheets {\n            css.add(stylesheet);\n        }\n    } else {\n        for style in root.descendent_elements().filter(|e| e.value().name() == "style") {\n            css.add(&style.text().collect::<String>());\n        }\n    }'''
+          assert old in s
+          s=s.replace(old,new,1)
+          s=s.replace('crate::shared::html::to_blocks(&body, &css, &StandaloneCtx)?;\n\n    Ok(Document { blocks, ..Document::default() })','crate::shared::html::to_blocks(&body, &css, ctx)?;\n\n    Ok(Document { assets, blocks, ..Document::default() })',1)
+          old='''fn decode_html(bytes: &[u8]) -> String {'''
+          new='''pub(crate) fn decode_html(bytes: &[u8]) -> String {\n    decode_html_with_charset(bytes, None)\n}\n\npub(crate) fn decode_html_with_charset(bytes: &[u8], declared_charset: Option<&str>) -> String {'''
+          assert old in s
+          s=s.replace(old,new,1)
+          needle='''    if let Some(encoding) = sniff_meta_charset(bytes) {'''
+          repl='''    if let Some(encoding) =\n        declared_charset.and_then(|label| Encoding::for_label(label.trim().as_bytes()))\n    {\n        return encoding.decode(bytes).0.into_owned();\n    }\n    if let Some(encoding) = sniff_meta_charset(bytes) {'''
+          assert needle in s
+          s=s.replace(needle,repl,1)
+          p.write_text(s)
+          PY
+          git add src/formats/html.rs
+          git commit -m "merge: sync canonical HTML base from #147"
+      - name: Verify canonical HTML regressions after sync
+        run: |
+          cargo test --locked --test html pdf_header_before_html_marker_remains_pdf
+          cargo test --locked --test html alternating_heading_start_tags_do_not_count_as_nested_depth
+      - name: Add MHTML regressions (RED)
+        shell: bash
+        run: |
+          cat >> tests/mhtml.rs <<'RS'
+
+          #[test]
+          fn empty_html_base_falls_back_to_root_content_location() {
+              let mhtml = mhtml_fixture(r#"MIME-Version: 1.0
+          Content-Type: multipart/related; type="text/html"; boundary="b"
+
+          --b
+          Content-Type: text/html; charset=utf-8
+          Content-Location: https://example.test/docs/page.html
+
+          <!doctype html><base href=""><p><img alt="pixel" src="images/pixel.png"></p>
+          --b
+          Content-Type: image/png
+          Content-Location: https://example.test/docs/images/pixel.png
+          Content-Transfer-Encoding: base64
+
+          AAECAw==
+          --b--
+          "#);
+              let document = to_document(&mhtml, Some(Format::Mhtml)).unwrap();
+              assert!(matches!(&document.blocks[0], Block::Paragraph(inlines) if matches!(&inlines[0], Inline::Image { source: ImageSource::Asset(AssetId(0)), .. })));
+          }
+
+          #[test]
+          fn image_fragment_is_ignored_for_embedded_resource_lookup() {
+              let mhtml = mhtml_fixture(r#"MIME-Version: 1.0
+          Content-Type: multipart/related; type="text/html"; boundary="b"
+
+          --b
+          Content-Type: text/html; charset=utf-8
+          Content-Location: https://example.test/page.html
+
+          <!doctype html><p><img alt="pixel" src="https://example.test/pixel.png#view"></p>
+          --b
+          Content-Type: image/png
+          Content-Location: https://example.test/pixel.png
+          Content-Transfer-Encoding: base64
+
+          AAECAw==
+          --b--
+          "#);
+              let document = to_document(&mhtml, Some(Format::Mhtml)).unwrap();
+              assert!(matches!(&document.blocks[0], Block::Paragraph(inlines) if matches!(&inlines[0], Inline::Image { source: ImageSource::Asset(AssetId(0)), .. })));
+          }
+
+          #[test]
+          fn stylesheet_fragment_is_ignored_for_embedded_resource_lookup() {
+              let mhtml = mhtml_fixture(r#"MIME-Version: 1.0
+          Content-Type: multipart/related; type="text/html"; boundary="b"
+
+          --b
+          Content-Type: text/html; charset=utf-8
+          Content-Location: https://example.test/page.html
+
+          <!doctype html><link rel="stylesheet" href="https://example.test/site.css#theme"><p class="strong">keep me</p>
+          --b
+          Content-Type: text/css; charset=utf-8
+          Content-Location: https://example.test/site.css
+
+          .strong { font-weight: bold }
+          --b--
+          "#);
+              assert_eq!(to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap(), "**keep me**\n");
+          }
+
+          #[test]
+          fn protocol_relative_mhtml_image_without_base_is_external() {
+              let mhtml = mhtml_fixture(r#"MIME-Version: 1.0
+          Content-Type: multipart/related; type="text/html"; boundary="b"
+
+          --b
+          Content-Type: text/html; charset=utf-8
+
+          <!doctype html><p><img alt="pixel" src="//cdn.example.test/image.png"></p>
+          --b--
+          "#);
+              let document = to_document(&mhtml, Some(Format::Mhtml)).unwrap();
+              assert!(matches!(&document.blocks[0], Block::Paragraph(inlines) if matches!(&inlines[0], Inline::Image { source: ImageSource::External(url), .. } if url == "//cdn.example.test/image.png")));
+          }
+          RS
+          set +e
+          cargo test --locked --test mhtml empty_html_base_falls_back_to_root_content_location
+          a=$?
+          cargo test --locked --test mhtml image_fragment_is_ignored_for_embedded_resource_lookup
+          b=$?
+          cargo test --locked --test mhtml stylesheet_fragment_is_ignored_for_embedded_resource_lookup
+          c=$?
+          cargo test --locked --test mhtml protocol_relative_mhtml_image_without_base_is_external
+          d=$?
+          set -e
+          echo "RED statuses: $a $b $c $d"
+          test "$a" -ne 0 && test "$b" -ne 0 && test "$c" -ne 0 && test "$d" -ne 0
+      - name: Apply minimal MHTML fixes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/formats/mhtml.rs')
+          s=p.read_text()
+          old='.map(|href| resolve_resource_reference(root_location, href))\n        .or_else(|| root_location.map(canonical_reference))'
+          new='.map(|href| resolve_resource_reference(root_location, href))\n        .filter(|base| !base.is_empty())\n        .or_else(|| root_location.map(canonical_reference))'
+          assert old in s
+          s=s.replace(old,new,1)
+          old='''                let reference = resolve_resource_reference(resource_base, href);\n                let Some(&part_index) = resource_index.get(&reference) else {'''
+          new='''                let reference = resolve_resource_reference(resource_base, href);\n                let lookup = resource_lookup_key(&reference);\n                let Some(&part_index) = resource_index.get(lookup) else {'''
+          assert old in s
+          s=s.replace(old,new,1)
+          marker='''fn normalize_url_path(path: &str) -> String {'''
+          helper='''fn resource_lookup_key(reference: &str) -> &str {\n    reference.split_once('#').map_or(reference, |(resource, _)| resource)\n}\n\n'''
+          assert marker in s
+          s=s.replace(marker,helper+marker,1)
+          old='''        let reference = resolve_resource_reference(self.resource_base.as_deref(), src);\n        if let Some(&asset_id) = self.image_assets.get(&reference) {'''
+          new='''        let reference = resolve_resource_reference(self.resource_base.as_deref(), src);\n        let lookup = resource_lookup_key(&reference);\n        if let Some(&asset_id) = self.image_assets.get(lookup) {'''
+          assert old in s
+          s=s.replace(old,new,1)
+          old='''        Ok(is_absolute_uri(&reference).then_some(ImageSource::External(reference)))'''
+          new='''        Ok((is_absolute_uri(&reference) || reference.starts_with("//"))\n            .then_some(ImageSource::External(reference)))'''
+          assert old in s
+          s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+          cargo fmt --all
+          git add src/formats/mhtml.rs tests/mhtml.rs
+          git commit -m "fix: resolve remaining MHTML resource edge cases"
+      - name: Targeted GREEN regressions
+        run: |
+          cargo test --locked --test mhtml empty_html_base_falls_back_to_root_content_location
+          cargo test --locked --test mhtml image_fragment_is_ignored_for_embedded_resource_lookup
+          cargo test --locked --test mhtml stylesheet_fragment_is_ignored_for_embedded_resource_lookup
+          cargo test --locked --test mhtml protocol_relative_mhtml_image_without_base_is_external
+          cargo test --locked --test mhtml
+          cargo test --locked --test html
+      - name: Freeze exact candidate
+        id: candidate
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git status --porcelain=v1
+          test -z "$(git status --porcelain=v1)"
+      - name: Rust full gate
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --locked
+      - name: Node full gate
+        working-directory: node
+        run: |
+          npm ci
+          npm run build
+          npm test
+          git diff --exit-code -- index.js index.d.ts
+      - name: WASM full gate
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo clippy -p anydoc-wasm --target wasm32-unknown-unknown -- -D warnings
+          cargo install wasm-pack --version 0.15.0 --locked
+          wasm-pack build wasm --release --target web --scope firecrawl
+          node --test wasm/test.mjs
+      - name: Python full gate
+        run: |
+          python -m pip install --upgrade pip maturin
+          rm -rf dist
+          maturin build --release --locked --manifest-path python/Cargo.toml --out dist
+          python -m pip install --force-reinstall --no-index --find-links dist firecrawl-anydoc
+          python - <<'PY'
+          import anydoc
+          print(anydoc.__file__)
+          assert '/site-packages/' in anydoc.__file__
+          PY
+          python -m unittest discover -s python/tests
+      - name: Real MHTML fixture validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin verify/mhtml-review3-candidate
+          parts=(.ci-fixture/mhtml.xz.b64.00 .ci-fixture/mhtml.xz.b64.01 .ci-fixture/mhtml.xz.b64.03 .ci-fixture/mhtml.xz.b64.05 .ci-fixture/mhtml.xz.b64.07 .ci-fixture/mhtml.xz.b64.09 .ci-fixture/mhtml.xz.b64.11)
+          : > /tmp/mhtml.xz.b64
+          for part in "${parts[@]}"; do git show "origin/verify/mhtml-review3-candidate:$part" >> /tmp/mhtml.xz.b64; done
+          base64 -d /tmp/mhtml.xz.b64 > /tmp/mhtml.xz
+          xz -dc /tmp/mhtml.xz > /tmp/fixture.mhtml
+          test "$(stat -c%s /tmp/fixture.mhtml)" = "505883"
+          echo "387c6f2d7223da224a8f55962b97eac947734c97fc84888e1e5619e93745837c  /tmp/fixture.mhtml" | sha256sum -c -
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib, anydoc
+          raw=Path('/tmp/fixture.mhtml').read_bytes()
+          assert anydoc.detect(raw) == 'mhtml'
+          out=anydoc.to_markdown(raw)
+          data=out.encode('utf-8') if isinstance(out,str) else out
+          text=data.decode('utf-8')
+          assert 'TRIBUNAL REGIONAL ELEITORAL DA PARAÍBA' in text
+          assert '�' not in text and 'Ã' not in text and 'Â' not in text
+          print('output_size',len(data))
+          print('output_sha256',hashlib.sha256(data).hexdigest())
+          assert len(data)==78154
+          assert hashlib.sha256(data).hexdigest()=='f6f75cec7bc06afe038bd89cd7967e5af358ec3562553f5bfc5c47c0299eb80c'
+          PY
+      - name: Confirm exact candidate unchanged
+        run: |
+          test "$(git rev-parse HEAD)" = "${{ steps.candidate.outputs.sha }}"
+          test -z "$(git status --porcelain=v1)"
+      - name: Publish validated candidate branch
+        run: git push --force origin HEAD:refs/heads/verify/mhtml-sync147-candidate
