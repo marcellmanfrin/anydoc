@@ -1,0 +1,246 @@
+name: Verify MHTML corpus sync
+on:
+  push:
+    branches: [verify/mhtml-corpus-sync-75cc2d2]
+permissions:
+  contents: write
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build reconciled candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "anydoc-ci"
+          git config user.email "anydoc-ci@users.noreply.github.com"
+          git checkout --detach bdb9456f5f931842fe7fda6e40ae0b9243f79b3d
+          git fetch https://github.com/firecrawl/anydoc.git 75cc2d272e1db7ec73a7e0ecfbc90bc244b69fbb
+          git cherry-pick fbe5339f2eb23a64f84007bd75c873c70cc9b032..75cc2d272e1db7ec73a7e0ecfbc90bc244b69fbb
+          test "$(git diff fbe5339f2eb23a64f84007bd75c873c70cc9b032..75cc2d272e1db7ec73a7e0ecfbc90bc244b69fbb --name-only | sort | tr '\n' ' ')" = "src/shared/html.rs tests/fixtures/html/controlled-document.html tests/fixtures/html/controlled-lists.html tests/fixtures/html/controlled-merged-table.html tests/fixtures/html/libreoffice-docx-numbering.html tests/fixtures/html/libreoffice-docx-text.html tests/fixtures/html/libreoffice-xlsx-merged.html tests/html.rs tests/html_corpus.rs tests/html_list.rs tests/snapshots.rs tests/snapshots/snapshots__html__controlled-document.html.snap tests/snapshots/snapshots__html__controlled-lists.html.snap tests/snapshots/snapshots__html__controlled-merged-table.html.snap tests/snapshots/snapshots__html__libreoffice-docx-numbering.html.snap tests/snapshots/snapshots__html__libreoffice-docx-text.html.snap tests/snapshots/snapshots__html__libreoffice-xlsx-merged.html.snap "
+          git diff --exit-code 75cc2d272e1db7ec73a7e0ecfbc90bc244b69fbb -- src/shared/html.rs tests/fixtures/html tests/html_corpus.rs tests/html_list.rs tests/snapshots/snapshots__html__controlled-document.html.snap tests/snapshots/snapshots__html__controlled-lists.html.snap tests/snapshots/snapshots__html__controlled-merged-table.html.snap tests/snapshots/snapshots__html__libreoffice-docx-numbering.html.snap tests/snapshots/snapshots__html__libreoffice-docx-text.html.snap tests/snapshots/snapshots__html__libreoffice-xlsx-merged.html.snap
+      - name: Add realistic MHTML integration regressions
+        shell: bash
+        run: |
+          cat > tests/mhtml_corpus.rs <<'RS'
+          use anydoc::model::{Block, ImageSource, Inline};
+          use anydoc::{Format, to_document, to_markdown_bytes};
+          use std::fs;
+          use std::path::PathBuf;
+
+          fn html_fixture(name: &str) -> PathBuf {
+              PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                  .join("tests")
+                  .join("fixtures")
+                  .join("html")
+                  .join(name)
+          }
+
+          fn mhtml_root(html: &[u8], transfer_encoding: Option<&str>) -> Vec<u8> {
+              let body = match transfer_encoding {
+                  Some("base64") => base64_encode(html),
+                  None => String::from_utf8(html.to_vec()).unwrap(),
+                  other => panic!("unsupported transfer encoding: {other:?}"),
+              };
+              let transfer = transfer_encoding
+                  .map(|encoding| format!("Content-Transfer-Encoding: {encoding}\r\n"))
+                  .unwrap_or_default();
+              format!(
+                  "From: <Saved by Blink>\r\nSnapshot-Content-Location: https://example.test/docs/page.html\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; type=\"text/html\"; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/html; charset=utf-8\r\nContent-Location: https://example.test/docs/page.html\r\n{transfer}\r\n{body}\r\n--b--\r\n"
+              )
+              .into_bytes()
+          }
+
+          fn base64_encode(bytes: &[u8]) -> String {
+              const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+              let mut out = String::new();
+              for chunk in bytes.chunks(3) {
+                  let a = chunk[0];
+                  let b = chunk.get(1).copied().unwrap_or(0);
+                  let c = chunk.get(2).copied().unwrap_or(0);
+                  out.push(TABLE[(a >> 2) as usize] as char);
+                  out.push(TABLE[(((a & 0x03) << 4) | (b >> 4)) as usize] as char);
+                  out.push(if chunk.len() > 1 { TABLE[(((b & 0x0f) << 2) | (c >> 6)) as usize] as char } else { '=' });
+                  out.push(if chunk.len() > 2 { TABLE[(c & 0x3f) as usize] as char } else { '=' });
+              }
+              out
+          }
+
+          #[test]
+          fn realistic_html_fixtures_are_byte_invariant_when_wrapped_as_mhtml() {
+              for name in [
+                  "controlled-document.html",
+                  "controlled-lists.html",
+                  "controlled-merged-table.html",
+                  "libreoffice-docx-numbering.html",
+                  "libreoffice-docx-text.html",
+                  "libreoffice-xlsx-merged.html",
+              ] {
+                  let html = fs::read(html_fixture(name)).unwrap();
+                  let standalone = to_markdown_bytes(&html, Some(Format::Html)).unwrap();
+                  let mhtml = mhtml_root(&html, None);
+                  assert_eq!(Format::from_bytes(&mhtml), Some(Format::Mhtml), "{name}");
+                  let wrapped = to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap();
+                  assert_eq!(wrapped, standalone, "MHTML changed standalone HTML semantics for {name}");
+              }
+          }
+
+          #[test]
+          fn realistic_utf8_html_is_invariant_through_base64_mhtml_root() {
+              let html = fs::read(html_fixture("controlled-document.html")).unwrap();
+              let standalone = to_markdown_bytes(&html, Some(Format::Html)).unwrap();
+              let mhtml = mhtml_root(&html, Some("base64"));
+              assert_eq!(to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap(), standalone);
+          }
+
+          #[test]
+          fn realistic_document_resolves_related_css_and_image_resources() {
+              let html = fs::read_to_string(html_fixture("controlled-document.html")).unwrap();
+              let html = html
+                  .replace("<style>\n    .strong { font-weight: bold; }\n    .hidden { display: none; }\n  </style>", "<base href=\"https://cdn.example.test/assets/\"><link rel=\"stylesheet\" href=\"styles/site.css\">")
+                  .replace("</body>", "<p><img alt=\"pixel\" src=\"images/pixel.png\"></p></body>");
+              let mhtml = format!(
+                  "From: <Saved by Blink>\r\nSnapshot-Content-Location: https://example.test/docs/page.html\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; type=\"text/html\"; start=\"<root@id>\"; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/html; charset=utf-8\r\nContent-ID: <root@id>\r\nContent-Location: https://example.test/docs/page.html\r\n\r\n{html}\r\n--b\r\nContent-Type: text/css; charset=utf-8\r\nContent-Location: https://cdn.example.test/assets/styles/site.css\r\n\r\n.strong {{ font-weight: bold; }} .hidden {{ display: none; }}\r\n--b\r\nContent-Type: image/png\r\nContent-ID: <IMAGE@ID>\r\nContent-Location: https://cdn.example.test/assets/images/pixel.png\r\nContent-Transfer-Encoding: base64\r\n\r\nAAECAw==\r\n--b--\r\n"
+              ).into_bytes();
+              let document = to_document(&mhtml, Some(Format::Mhtml)).unwrap();
+              assert_eq!(document.assets.len(), 1);
+              assert!(document.blocks.iter().any(|block| matches!(block, Block::Paragraph(inlines) if inlines.iter().any(|inline| matches!(inline, Inline::Image { source: ImageSource::Asset(_), .. })) )));
+              let markdown = to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap();
+              assert!(markdown.contains("# Fixture Document"));
+              assert!(markdown.contains("**Styled bold paragraph.**"));
+              assert!(!markdown.contains("drop me"));
+              assert!(markdown.contains("café Ł music 𝄞 family 👨‍👩‍👧"));
+          }
+
+          #[test]
+          fn common_mime_messages_remain_outside_mhtml_autodetection() {
+              for subtype in ["mixed", "alternative"] {
+                  let email = format!(
+                      "MIME-Version: 1.0\r\nContent-Type: multipart/{subtype}; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/html; charset=utf-8\r\nContent-ID: <root@id>\r\n\r\n<p>ordinary email</p>\r\n--b\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"file.bin\"\r\n\r\ndata\r\n--b--\r\n"
+                  ).into_bytes();
+                  assert_eq!(Format::from_bytes(&email), None, "multipart/{subtype}");
+              }
+          }
+          RS
+          git add tests/mhtml_corpus.rs
+          git commit -m "test: add realistic MHTML corpus integration coverage"
+      - name: Apply MHTML preflight ordering fix
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          hp = Path('src/formats/html.rs')
+          hs = hp.read_text()
+          old = 'fn preflight_html_complexity(text: &str) -> Result<(), ConvertError> {'
+          new = 'pub(crate) fn preflight_html_complexity(text: &str) -> Result<(), ConvertError> {'
+          assert old in hs
+          hp.write_text(hs.replace(old, new, 1))
+
+          mp = Path('src/formats/mhtml.rs')
+          ms = mp.read_text()
+          old = '''    let html = super::html::decode_html_with_charset(&html_bytes, declared_charset);\n    let parsed_html = Html::parse_document(&html);'''
+          new = '''    let html = super::html::decode_html_with_charset(&html_bytes, declared_charset);\n    super::html::preflight_html_complexity(&html)?;\n    let parsed_html = Html::parse_document(&html);'''
+          assert old in ms
+          mp.write_text(ms.replace(old, new, 1))
+          PY
+          cat >> tests/mhtml.rs <<'RS'
+
+          #[test]
+          fn mhtml_root_enforces_html_depth_limit() {
+              let mut html = String::from("<!doctype html>");
+              for _ in 0..300 {
+                  html.push_str("<div>");
+              }
+              html.push_str("deep");
+              for _ in 0..300 {
+                  html.push_str("</div>");
+              }
+              let mhtml = mhtml_fixture(&format!(
+                  "MIME-Version: 1.0\nContent-Type: multipart/related; type=\"text/html\"; boundary=\"b\"\n\n--b\nContent-Type: text/html; charset=utf-8\n\n{html}\n--b--\n"
+              ));
+              let error = to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap_err();
+              assert!(matches!(error, ConvertError::ResourceLimit { limit: "max_xml_depth", .. }));
+          }
+          RS
+          cargo fmt --all
+          git add src/formats/html.rs src/formats/mhtml.rs tests/mhtml.rs
+          git commit -m "fix: preflight MHTML HTML roots before DOM construction"
+      - name: Specific HTML and MHTML validation
+        run: |
+          cargo test --locked --test html
+          cargo test --locked --test html_corpus
+          cargo test --locked --test html_list
+          cargo test --locked --test mhtml
+          cargo test --locked --test mhtml_corpus
+      - name: Freeze exact candidate
+        id: candidate
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git diff --exit-code
+      - name: Rust full gate
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --locked
+      - name: Node full gate
+        working-directory: node
+        run: |
+          npm ci
+          npm run build
+          npm test
+          git diff --exit-code -- index.js index.d.ts
+      - name: WASM full gate
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo clippy -p anydoc-wasm --target wasm32-unknown-unknown -- -D warnings
+          curl -sSfL https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.15.0/wasm-pack-v0.15.0-x86_64-unknown-linux-musl.tar.gz | tar xz --strip-components=1 -C /usr/local/bin wasm-pack-v0.15.0-x86_64-unknown-linux-musl/wasm-pack
+          wasm-pack build wasm --release --target web --scope firecrawl
+          node --test wasm/test.mjs
+      - name: Python full gate
+        run: |
+          python -m pip install --upgrade pip maturin
+          rm -rf dist
+          maturin build --release --locked --manifest-path python/Cargo.toml --out dist
+          python -m pip install --force-reinstall --no-index --find-links dist firecrawl-anydoc
+          python - <<'PY'
+          import anydoc
+          print(anydoc.__file__)
+          assert '/site-packages/' in anydoc.__file__
+          PY
+          python -m unittest discover -s python/tests
+      - name: Real MHTML fixture validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin verify/mhtml-review3-candidate
+          parts=(.ci-fixture/mhtml.xz.b64.00 .ci-fixture/mhtml.xz.b64.01 .ci-fixture/mhtml.xz.b64.03 .ci-fixture/mhtml.xz.b64.05 .ci-fixture/mhtml.xz.b64.07 .ci-fixture/mhtml.xz.b64.09 .ci-fixture/mhtml.xz.b64.11)
+          : > /tmp/mhtml.xz.b64
+          for part in "${parts[@]}"; do git show "origin/verify/mhtml-review3-candidate:$part" >> /tmp/mhtml.xz.b64; done
+          base64 -d /tmp/mhtml.xz.b64 > /tmp/mhtml.xz
+          xz -dc /tmp/mhtml.xz > /tmp/fixture.mhtml
+          test "$(stat -c%s /tmp/fixture.mhtml)" = "505883"
+          echo "387c6f2d7223da224a8f55962b97eac947734c97fc84888e1e5619e93745837c  /tmp/fixture.mhtml" | sha256sum -c -
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib, anydoc
+          raw=Path('/tmp/fixture.mhtml').read_bytes()
+          assert anydoc.format_from_bytes(raw) == 'mhtml'
+          out=anydoc.to_markdown_bytes(raw)
+          data=out.encode('utf-8') if isinstance(out,str) else out
+          text=data.decode('utf-8')
+          assert 'TRIBUNAL REGIONAL ELEITORAL DA PARAÍBA' in text
+          assert '�' not in text and 'Ã' not in text and 'Â' not in text
+          print('output_size',len(data))
+          print('output_sha256',hashlib.sha256(data).hexdigest())
+          assert len(data)==78154
+          assert hashlib.sha256(data).hexdigest()=='f6f75cec7bc06afe038bd89cd7967e5af358ec3562553f5bfc5c47c0299eb80c'
+          PY
+      - name: Confirm exact candidate unchanged
+        run: |
+          test "$(git rev-parse HEAD)" = "${{ steps.candidate.outputs.sha }}"
+          git diff --exit-code
+      - name: Publish validated candidate
+        run: git push --force origin HEAD:refs/heads/verify/mhtml-corpus-sync-candidate
