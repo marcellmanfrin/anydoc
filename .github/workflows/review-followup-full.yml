@@ -12,7 +12,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - name: Checkout exact functional candidate
-        run: git checkout --detach 238a1e53ba66700a0d538cf39ebddffb34895dd7
+        run: git checkout --detach 32f02126a1dbca26f58de41d81e4e0ce2b096066
       - name: Specific HTML and MHTML validation
         run: |
           cargo test --locked --test review_followup
@@ -76,5 +76,5 @@ jobs:
           PY
       - name: Confirm exact candidate identity
         run: |
-          test "$(git rev-parse HEAD)" = "238a1e53ba66700a0d538cf39ebddffb34895dd7"
+          test "$(git rev-parse HEAD)" = "32f02126a1dbca26f58de41d81e4e0ce2b096066"
           git diff --exit-code
