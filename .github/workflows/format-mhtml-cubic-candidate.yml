@@ -1,0 +1,31 @@
+name: format-mhtml-cubic-candidate
+
+on:
+  push:
+    branches:
+      - verify/mhtml-cubic-format-1
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: review/mhtml-followup-candidate2
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format candidate
+        run: cargo fmt --all
+      - name: Commit formatting only
+        run: |
+          git config user.name "AnyDoc CI"
+          git config user.email "ci@example.invalid"
+          git add src/formats/html.rs src/formats/mhtml.rs tests python
+          git diff --cached --check
+          git commit -m "style: format Cubic follow-up candidate"
+          git push origin HEAD:review/mhtml-followup-candidate2
