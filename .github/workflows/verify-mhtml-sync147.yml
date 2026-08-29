@@ -1,0 +1,28 @@
+name: Verify MHTML sync #147
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  merge-diagnostic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch canonical HTML head
+        run: git fetch origin fbe5339f2eb23a64f84007bd75c873c70cc9b032
+      - name: Diagnose semantic merge
+        shell: bash
+        run: |
+          set +e
+          git config user.name "anydoc-ci"
+          git config user.email "anydoc-ci@users.noreply.github.com"
+          git merge --no-commit --no-ff fbe5339f2eb23a64f84007bd75c873c70cc9b032
+          rc=$?
+          echo "merge_rc=$rc"
+          echo "=== unmerged ==="
+          git diff --name-only --diff-filter=U || true
+          echo "=== status ==="
+          git status --short
+          exit $rc
