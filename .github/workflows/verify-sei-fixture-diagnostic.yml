@@ -1,0 +1,37 @@
+name: Diagnose SEI validation fixture secrets
+on:
+  push:
+    branches: [verify/sei-fixture-diagnostic]
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    env:
+      FIXTURE_1: ${{ secrets.ANYDOC_FIXTURE_1 }}
+      VALIDATION: ${{ secrets.ANYDOC_VALIDATION_FIXTURE_URL }}
+    steps:
+      - name: Inspect secret-backed downloads
+        shell: bash
+        run: |
+          set -u
+          inspect() {
+            label="$1"
+            url="$2"
+            path="/tmp/$label.bin"
+            if [ -z "$url" ]; then
+              echo "$label present=no"
+              return
+            fi
+            echo "$label present=yes"
+            if curl -fsSL "$url" -o "$path"; then
+              printf '%s bytes=' "$label"
+              wc -c < "$path"
+              printf '%s sha256=' "$label"
+              sha256sum "$path" | cut -d' ' -f1
+              printf '%s mime=' "$label"
+              file -b --mime-type "$path"
+            else
+              echo "$label download=failed"
+            fi
+          }
+          inspect fixture1 "$FIXTURE_1"
+          inspect validation "$VALIDATION"
