@@ -1,0 +1,21 @@
+name: Verify HTML regressions after list fix
+
+on:
+  push:
+    branches: [verify/html-corpus-postfix]
+
+permissions:
+  contents: read
+
+jobs:
+  html:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo test --locked --test html
+      - run: cargo test --locked --test html_corpus
