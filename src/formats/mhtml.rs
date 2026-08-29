@@ -293,11 +293,11 @@ fn resource_keys(part: &mail_parser::MessagePart<'_>, resource_base: Option<&str
         let id = normalize_content_id(content_id);
         if !id.is_empty() {
             keys.push(format!("cid:{id}"));
-            keys.push(id);
         }
     }
     if let Some(location) = part.content_location() {
         let location = resolve_resource_reference(resource_base, location);
+        let location = resource_lookup_key(&location).to_owned();
         if !location.is_empty() && !keys.contains(&location) {
             keys.push(location);
         }
