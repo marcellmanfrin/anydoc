@@ -176,14 +176,11 @@ fn preflight_multipart_base64(
             // mail-parser 0.11.x reserves from MessageStream::remaining() before it scans
             // for the active MIME boundary, so the safe upper bound is deliberately the
             // entire remaining message rather than only this part's encoded body.
-            enforce_base64_parser_reserve(
-                bytes.len().saturating_sub(body_start),
-                max_entry_bytes,
-            )?;
+            enforce_base64_parser_reserve(bytes.len().saturating_sub(body_start), max_entry_bytes)?;
         }
 
-        let next_parent = find_bytes(&bytes[body_start..end], &marker)
-            .map_or(end, |next| body_start + next);
+        let next_parent =
+            find_bytes(&bytes[body_start..end], &marker).map_or(end, |next| body_start + next);
         if let Some(nested_boundary) = mime_boundary_from_headers(headers) {
             preflight_multipart_base64(
                 bytes,
@@ -221,7 +218,7 @@ fn mime_header_body_start(bytes: &[u8], start: usize, end: usize) -> Option<(usi
     let lf = slice.windows(2).position(|window| window == b"\n\n");
     match (crlf, lf) {
         (Some(a), Some(b)) if a <= b => Some((start + a, start + a + 4)),
-        (Some(a), Some(b)) => Some((start + b, start + b + 2)),
+        (Some(_a), Some(b)) => Some((start + b, start + b + 2)),
         (Some(a), None) => Some((start + a, start + a + 4)),
         (None, Some(b)) => Some((start + b, start + b + 2)),
         (None, None) => None,
