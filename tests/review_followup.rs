@@ -26,10 +26,9 @@ AAECAw==
     );
     let document = to_document(&mhtml, Some(Format::Mhtml)).unwrap();
     match &document.blocks[0] {
-        Block::Paragraph(inlines) => assert!(matches!(
-            &inlines[0],
-            Inline::Image { source: ImageSource::Unavailable, .. }
-        )),
+        Block::Paragraph(inlines) => {
+            assert!(matches!(&inlines[0], Inline::Image { source: ImageSource::Unavailable, .. }))
+        }
         other => panic!("expected paragraph, got {other:?}"),
     }
 }
