@@ -12,4 +12,4 @@ jobs:
         with:
           ref: 8497a052133b659c047d083d5ed016af3cd117b6
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test nested_anchor_repair_preserves_structural_depth_in_preflight --lib -- --exact --nocapture
+      - run: cargo test nested_anchor_repair_preserves_structural_depth_in_preflight --lib -- --nocapture
