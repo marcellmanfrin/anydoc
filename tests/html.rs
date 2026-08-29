@@ -1,4 +1,5 @@
-use anydoc::{ConvertError, Format, to_markdown_bytes};
+use anydoc::model::{Block, ImageSource, Inline};
+use anydoc::{ConvertError, Format, to_document, to_markdown_bytes};
 
 #[test]
 fn html_extensions_are_named() {
@@ -22,6 +23,12 @@ fn html_doctype_allows_html5_ascii_whitespace() {
 fn html_prefix_wins_over_embedded_pdf_marker() {
     let html = b"<!doctype html><html><body>%PDF-1.7 is text here</body></html>";
     assert_eq!(Format::from_bytes(html), Some(Format::Html));
+}
+
+#[test]
+fn pdf_header_before_html_marker_remains_pdf() {
+    let bytes = b"  %PDF-1.7\n<html><body>not an HTML root</body></html>";
+    assert_eq!(Format::from_bytes(bytes), Some(Format::Pdf));
 }
 
 #[test]
@@ -56,6 +63,26 @@ fn utf16_html_detection_allows_long_leading_whitespace() {
         be.extend_from_slice(&unit.to_be_bytes());
     }
     assert_eq!(Format::from_bytes(&be), Some(Format::Html));
+}
+
+#[test]
+fn utf16le_doctype_allows_long_whitespace_between_keyword_and_name() {
+    let source = format!("<!DOCTYPE{}html><html></html>", " ".repeat(80));
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in source.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    assert_eq!(Format::from_bytes(&bytes), Some(Format::Html));
+}
+
+#[test]
+fn utf16be_doctype_allows_long_whitespace_between_keyword_and_name() {
+    let source = format!("<!DOCTYPE{}html><html></html>", " ".repeat(80));
+    let mut bytes = vec![0xFE, 0xFF];
+    for unit in source.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_be_bytes());
+    }
+    assert_eq!(Format::from_bytes(&bytes), Some(Format::Html));
 }
 
 #[test]
@@ -135,7 +162,7 @@ fn scripts_are_not_document_content() {
 
 #[test]
 fn quoted_mime_parameter_semicolon_does_not_fake_charset() {
-    let mut html = b"<!doctype html><meta http-equiv=content-type content='text/html; note=\"x; charset=utf-8\"; charset=windows-1252'><p>".to_vec();
+    let mut html = br#"<!doctype html><meta http-equiv="content-type" content='text/html; note="x;charset=utf-8"; charset=windows-1252'><p>"#.to_vec();
     html.push(0x80);
     html.extend_from_slice(b"</p>");
     let markdown = to_markdown_bytes(&html, Some(Format::Html)).unwrap();
@@ -165,19 +192,17 @@ fn optional_p_end_tags_do_not_count_as_nested_depth() {
 
 #[test]
 fn meta_charset_after_first_kib_is_still_honored() {
-    let mut html = b"<!doctype html><head>".to_vec();
-    html.extend(std::iter::repeat_n(b' ', 1500));
-    html.extend_from_slice(b"<meta charset=iso-8859-2></head><body><p>");
+    let mut html = b"<!doctype html><html><head><style>/*".to_vec();
+    html.extend(std::iter::repeat_n(b'x', 2048));
+    html.extend_from_slice(b"*/</style><meta charset=iso-8859-2></head><body><p>");
     html.push(0xA3);
-    html.extend_from_slice(b"</p></body>");
+    html.extend_from_slice(b"</p></body></html>");
     let markdown = to_markdown_bytes(&html, Some(Format::Html)).unwrap();
     assert_eq!(markdown, "Ł\n");
 }
 
 #[test]
 fn protocol_relative_image_is_preserved_as_external() {
-    use anydoc::model::{Block, ImageSource, Inline};
-    use anydoc::to_document;
     let html = br#"<!doctype html><p><img alt="pixel" src="//cdn.example.test/image.png"></p>"#;
     let document = to_document(html, Some(Format::Html)).unwrap();
     match &document.blocks[0] {
@@ -190,8 +215,76 @@ fn protocol_relative_image_is_preserved_as_external() {
     }
 }
 
+fn assert_preflight_depth_limit(error: ConvertError) {
+    match error {
+        ConvertError::ResourceLimit { limit, detail } => {
+            assert_eq!(limit, "max_xml_depth");
+            assert!(
+                detail.contains("before DOM construction"),
+                "expected preflight depth rejection, got: {detail}"
+            );
+        }
+        other => panic!("expected max_xml_depth resource limit, got {other:?}"),
+    }
+}
+
 #[test]
-fn pdf_header_before_html_marker_remains_pdf() {
-    let bytes = b"  %PDF-1.7\n<html><body>not an HTML root</body></html>";
-    assert_eq!(Format::from_bytes(bytes), Some(Format::Pdf));
+fn non_void_self_closing_html_tags_still_count_toward_preflight_depth() {
+    let mut html = String::from("<!doctype html>");
+    for _ in 0..300 {
+        html.push_str("<div/>");
+    }
+
+    assert_preflight_depth_limit(
+        to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err(),
+    );
+}
+
+#[test]
+fn successive_headings_are_implicitly_closed_before_preflight_depth_counting() {
+    let mut html = String::from("<!doctype html>");
+    for i in 0..300 {
+        html.push_str(&format!("<h1>heading {i}"));
+    }
+
+    let markdown = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap();
+    assert!(markdown.contains("# heading 299"));
+}
+
+#[test]
+fn alternating_headings_are_implicitly_closed_before_preflight_depth_counting() {
+    const HEADINGS: [&str; 6] = ["h1", "h2", "h3", "h4", "h5", "h6"];
+    let mut html = String::from("<!doctype html>");
+    for i in 0..300 {
+        let heading = HEADINGS[i % HEADINGS.len()];
+        html.push_str(&format!("<{heading}>heading {i}"));
+    }
+
+    let markdown = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap();
+    assert!(markdown.contains("heading 299"));
+}
+
+#[test]
+fn foreign_self_closing_svg_elements_do_not_accumulate_html_depth() {
+    let mut html = String::from("<!doctype html><svg>");
+    for _ in 0..300 {
+        html.push_str("<path/>");
+    }
+    html.push_str("</svg><p>ok</p>");
+
+    let markdown = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap();
+    assert!(markdown.contains("ok"));
+}
+
+#[test]
+fn html_inside_svg_foreign_object_still_counts_self_closing_non_void_depth() {
+    let mut html = String::from("<!doctype html><svg><foreignObject>");
+    for _ in 0..300 {
+        html.push_str("<div/>");
+    }
+    html.push_str("</foreignObject></svg>");
+
+    assert_preflight_depth_limit(
+        to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err(),
+    );
 }
