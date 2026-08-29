@@ -1,0 +1,148 @@
+name: cubic-anchor-fix
+
+on:
+  push:
+    branches: [review/mhtml-cubic-round5-ci]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: review/mhtml-cubic-round5
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply minimal fix and organize regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          html_src = Path('src/formats/html.rs')
+          text = html_src.read_text()
+          old = '''    if name == "a"
+                  && let Some(position) = open.iter().rposition(|candidate| candidate.as_ref() == "a")
+              {
+                  open.truncate(position);
+              }
+          '''
+          new = '''    if name == "a"
+                  && let Some(position) = open.iter().rposition(|candidate| candidate.as_ref() == "a")
+              {
+                  open.remove(position);
+              }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one anchor preflight block, found {text.count(old)}')
+          html_src.write_text(text.replace(old, new, 1))
+
+          html_tests = Path('tests/html.rs')
+          html_text = html_tests.read_text().rstrip() + '''\n\n#[test]
+          fn repeated_unclosed_anchors_do_not_trigger_depth_limit() {
+              let mut html = String::from("<!doctype html>");
+              for index in 0..300 {
+                  html.push_str(&format!("<a href=\\"#{index}\\">link"));
+              }
+              let result = to_markdown_bytes(html.as_bytes(), Some(Format::Html));
+              assert!(
+                  !matches!(result, Err(ConvertError::ResourceLimit { limit: "max_xml_depth", .. })),
+                  "HTML5 repairs repeated anchors; preflight must not reject them as excessive depth"
+              );
+          }
+
+          #[test]
+          fn intervening_blocks_between_unclosed_anchors_still_hit_preflight_depth_limit() {
+              let mut html = String::from("<!doctype html>");
+              for index in 0..300 {
+                  html.push_str(&format!("<a href=\\"#{index}\\"><div>"));
+              }
+
+              let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+              assert_preflight_depth_limit(error);
+          }
+          '''
+          html_tests.write_text(html_text)
+
+          mhtml_tests = Path('tests/mhtml.rs')
+          mhtml_text = mhtml_tests.read_text().rstrip() + '''\n\n#[test]
+          fn bare_relative_image_does_not_match_content_id() {
+              let mhtml = mhtml_fixture(
+                  r#"MIME-Version: 1.0
+          Content-Type: multipart/related; type="text/html"; boundary="b"
+
+          --b
+          Content-Type: text/html; charset=utf-8
+
+          <!doctype html><p><img alt="pixel" src="image@id"></p>
+          --b
+          Content-Type: image/png
+          Content-ID: <image@id>
+          Content-Transfer-Encoding: base64
+
+          AAECAw==
+          --b--
+          "#,
+              );
+              let document = to_document(&mhtml, Some(Format::Mhtml)).unwrap();
+              match &document.blocks[0] {
+                  Block::Paragraph(inlines) => {
+                      assert!(matches!(&inlines[0], Inline::Image { source: ImageSource::Unavailable, .. }))
+                  }
+                  other => panic!("expected paragraph, got {other:?}"),
+              }
+          }
+
+          #[test]
+          fn content_location_fragment_is_ignored_for_resource_lookup() {
+              let mhtml = mhtml_fixture(
+                  r#"MIME-Version: 1.0
+          Content-Type: multipart/related; type="text/html"; boundary="b"
+
+          --b
+          Content-Type: text/html; charset=utf-8
+          Content-Location: https://example.test/page.html
+
+          <!doctype html><link rel="stylesheet" href="https://example.test/site.css"><p class="strong">keep me</p>
+          --b
+          Content-Type: text/css; charset=utf-8
+          Content-Location: https://example.test/site.css#saved
+
+          .strong { font-weight: bold }
+          --b--
+          "#,
+              );
+              assert_eq!(to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap(), "**keep me**\\n");
+          }
+          '''
+          mhtml_tests.write_text(mhtml_text)
+
+          Path('tests/review_followup.rs').unlink()
+          Path('tests/cubic_anchor_preflight_red.rs').unlink()
+          PY
+          cargo fmt --all
+          git diff --check
+      - name: Run focused HTML anchor regressions
+        run: |
+          cargo test --locked --test html repeated_unclosed_anchors_do_not_trigger_depth_limit -- --exact
+          cargo test --locked --test html intervening_blocks_between_unclosed_anchors_still_hit_preflight_depth_limit -- --exact
+      - name: Run moved MHTML regressions
+        run: |
+          cargo test --locked --test mhtml bare_relative_image_does_not_match_content_id -- --exact
+          cargo test --locked --test mhtml content_location_fragment_is_ignored_for_resource_lookup -- --exact
+      - name: Commit and push development candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Marcell Manfrin Barbacena"
+          git config user.email "barbacena@gmail.com"
+          git add src/formats/html.rs tests/html.rs tests/mhtml.rs tests/review_followup.rs tests/cubic_anchor_preflight_red.rs
+          git commit -m "fix: preserve structural depth across anchor recovery"
+          echo "candidate_sha=$(git rev-parse HEAD)"
+          git push origin HEAD:review/mhtml-cubic-round5
