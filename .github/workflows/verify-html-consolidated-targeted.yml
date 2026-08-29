@@ -1,0 +1,27 @@
+name: Verify HTML consolidated targeted
+
+on:
+  push:
+    branches: [verify/html-consolidated-targeted]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Targeted HTML regressions
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - name: PDF before HTML marker remains PDF
+        run: cargo test --locked --test html pdf_header_before_html_marker_remains_pdf
+      - name: Alternating headings stay within preflight depth
+        run: cargo test --locked --test html alternating_headings_are_implicitly_closed_before_preflight_depth_counting
+      - name: Full HTML regression suite
+        run: cargo test --locked --test html
