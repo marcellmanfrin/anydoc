@@ -5,7 +5,8 @@ use crate::model::{AnchorId, Asset, AssetId, Document, ImageSource, LinkTarget};
 use crate::package::limits;
 use crate::shared::html::HtmlCtx;
 use crate::shared::uri::is_absolute_uri;
-use mail_parser::{MessageParser, MessagePart, MimeHeaders};
+use mail_parser::decoders::{base64::base64_decode, quoted_printable::quoted_printable_decode};
+use mail_parser::{Encoding, Message, MessageParser, MessagePart, MimeHeaders};
 use scraper::Html;
 use std::collections::HashMap;
 
@@ -98,7 +99,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
     }
     .ok_or_else(|| ConvertError::malformed("MHTML contains no HTML root part"))?;
 
-    let html_bytes = decoded_part_bytes(html_part, "HTML root")?;
+    let html_bytes = transfer_decoded_part_bytes(&message, html_part, "HTML root")?;
 
     let declared_charset =
         html_part.content_type().and_then(|content_type| content_type.attribute("charset"));
@@ -195,19 +196,64 @@ fn ascii_trim(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
-fn decoded_part_bytes(part: &MessagePart<'_>, label: &str) -> Result<Vec<u8>, ConvertError> {
-    let bytes = part.contents();
-    if bytes.len() as u64 > limits::MAX_ENTRY_BYTES {
+fn transfer_decoded_part_bytes(
+    message: &Message<'_>,
+    part: &MessagePart<'_>,
+    label: &str,
+) -> Result<Vec<u8>, ConvertError> {
+    let raw = message
+        .raw_message
+        .get(part.offset_body as usize..part.offset_end as usize)
+        .ok_or_else(|| ConvertError::malformed(format!("MHTML {label} byte range is invalid")))?;
+
+    let decoded = match part.encoding {
+        Encoding::None => {
+            enforce_part_size(raw.len(), label, "body")?;
+            raw.to_vec()
+        }
+        Encoding::QuotedPrintable => {
+            enforce_part_size(raw.len(), label, "quoted-printable encoded body")?;
+            quoted_printable_decode(raw).ok_or_else(|| {
+                ConvertError::malformed(format!("MHTML {label} quoted-printable body is invalid"))
+            })?
+        }
+        Encoding::Base64 => {
+            let upper_bound = base64_decoded_upper_bound(raw);
+            if upper_bound > limits::MAX_ENTRY_BYTES {
+                return Err(ConvertError::ResourceLimit {
+                    limit: "max_entry_bytes",
+                    detail: format!(
+                        "MHTML {label} base64 body can decode to at most {upper_bound} bytes; maximum is {}",
+                        limits::MAX_ENTRY_BYTES
+                    ),
+                });
+            }
+            base64_decode(raw).ok_or_else(|| {
+                ConvertError::malformed(format!("MHTML {label} base64 body is invalid"))
+            })?
+        }
+    };
+
+    enforce_part_size(decoded.len(), label, "decoded body")?;
+    Ok(decoded)
+}
+
+fn enforce_part_size(size: usize, label: &str, kind: &str) -> Result<(), ConvertError> {
+    if size as u64 > limits::MAX_ENTRY_BYTES {
         return Err(ConvertError::ResourceLimit {
             limit: "max_entry_bytes",
             detail: format!(
-                "MHTML {label} is {} bytes; maximum is {}",
-                bytes.len(),
+                "MHTML {label} {kind} is {size} bytes; maximum is {}",
                 limits::MAX_ENTRY_BYTES
             ),
         });
     }
-    Ok(bytes.to_vec())
+    Ok(())
+}
+
+fn base64_decoded_upper_bound(raw: &[u8]) -> u64 {
+    let symbols = raw.iter().filter(|byte| !byte.is_ascii_whitespace()).count() as u64;
+    symbols.saturating_add(3).saturating_div(4).saturating_mul(3)
 }
 
 fn html_resource_base(parsed: &Html, root_location: Option<&str>) -> Option<String> {
