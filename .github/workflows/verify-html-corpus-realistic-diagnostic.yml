@@ -1,0 +1,17 @@
+name: Diagnose LibreOffice HTML corpus
+
+on:
+  push:
+    branches: [verify/html-corpus-realistic-diagnostic]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --test html_corpus_diagnostic -- --nocapture
