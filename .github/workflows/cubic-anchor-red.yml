@@ -1,0 +1,16 @@
+name: cubic-anchor-red
+
+on:
+  push:
+    branches: [review/mhtml-cubic-round5-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  red:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --test cubic_anchor_preflight_red
