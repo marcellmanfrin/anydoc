@@ -1,0 +1,147 @@
+name: Verify HTML corpus public fixture gate
+on:
+  push:
+    branches: [verify/html-corpus-public-fixture-gate]
+permissions:
+  contents: read
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --locked
+
+  msrv:
+    name: Rust MSRV 1.88
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.88
+      - run: cargo check --locked
+      - run: cargo test --locked --test html --no-run
+
+  node:
+    name: Node bindings
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: node/package-lock.json
+      - run: npm ci
+        working-directory: node
+      - run: npm run build
+        working-directory: node
+      - run: npm test
+        working-directory: node
+      - name: Committed bindings are up to date
+        run: |
+          if ! git diff --exit-code -- node/index.js node/index.d.ts; then
+            echo '::error::node/index.js or node/index.d.ts is out of date.'
+            exit 1
+          fi
+
+  wasm:
+    name: Wasm bindings
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32-unknown-unknown
+      - run: cargo clippy -p anydoc-wasm --target wasm32-unknown-unknown -- -D warnings
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+      - name: Install wasm-pack
+        run: >
+          curl -sSfL https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.15.0/wasm-pack-v0.15.0-x86_64-unknown-linux-musl.tar.gz
+          | tar xz --strip-components=1 -C /usr/local/bin wasm-pack-v0.15.0-x86_64-unknown-linux-musl/wasm-pack
+      - run: wasm-pack build wasm --release --target web --scope firecrawl
+      - run: node --test wasm/test.mjs
+
+  python:
+    name: Python bindings
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: pip install maturin
+      - run: maturin build --release --locked --manifest-path python/Cargo.toml --out dist
+      - run: pip install --no-index --find-links dist firecrawl-anydoc
+      - run: python -m unittest discover -s python/tests
+
+  html_specific:
+    name: HTML regressions + real SEI root
+    runs-on: ubuntu-24.04
+    env:
+      ANYDOC_VALIDATION_FIXTURE_URL: ${{ secrets.ANYDOC_VALIDATION_FIXTURE_URL }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --test html
+      - run: cargo test --locked --test html_corpus
+      - run: cargo test --locked --test snapshots corpus -- --exact
+      - run: cargo test --locked --test snapshots fixtures_detect_from_content -- --exact
+      - run: git diff --exit-code -- tests/snapshots
+      - name: Validate HTML root extracted from original SEI MHTML
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANYDOC_VALIDATION_FIXTURE_URL"
+          curl -fsSL "$ANYDOC_VALIDATION_FIXTURE_URL" -o /tmp/fixture.mhtml
+          echo '387c6f2d7223da224a8f55962b97eac947734c97fc84888e1e5619e93745837c  /tmp/fixture.mhtml' | sha256sum -c -
+          test "$(wc -c < /tmp/fixture.mhtml)" -eq 505883
+          python3 - <<'PY'
+          from email import policy
+          from email.parser import BytesParser
+          from pathlib import Path
+          source = Path('/tmp/fixture.mhtml').read_bytes()
+          message = BytesParser(policy=policy.default).parsebytes(source)
+          html_parts = [part for part in message.walk() if part.get_content_type() == 'text/html']
+          if len(html_parts) != 1:
+              raise SystemExit(f'expected exactly one text/html part, found {len(html_parts)}')
+          payload = html_parts[0].get_payload(decode=True)
+          Path('/tmp/root.html').write_bytes(payload)
+          PY
+          echo '32fca03d52dc62518bf4419e2a4b1be96160195cd99f613a2d3230f1bb1e817c  /tmp/root.html' | sha256sum -c -
+          test "$(wc -c < /tmp/root.html)" -eq 200381
+          cargo run --locked --example convert -- /tmp/root.html -f html -o /tmp/root.md
+          test -s /tmp/root.md
+          test "$(wc -c < /tmp/root.md)" -eq 78154
+          echo '6119ae4bb085acabe21149492020e159e431de4f7a169350b1b619f2add61c1a  /tmp/root.md' | sha256sum -c -
+          grep -F 'TRIBUNAL REGIONAL ELEITORAL DA PARAÍBA' /tmp/root.md >/dev/null
+          grep -F 'Estudos Técnicos Preliminares' /tmp/root.md >/dev/null
+          for bad in '�' 'Ã' 'Â'; do
+            if grep -F "$bad" /tmp/root.md >/dev/null; then
+              echo "mojibake marker found: $bad" >&2
+              exit 1
+            fi
+          done
+          printf 'mhtml-bytes='; wc -c < /tmp/fixture.mhtml
+          printf 'html-bytes='; wc -c < /tmp/root.html
+          printf 'markdown-bytes='; wc -c < /tmp/root.md
+          sha256sum /tmp/root.md
