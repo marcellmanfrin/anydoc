@@ -1,0 +1,159 @@
+name: Verify MHTML corpus sync v2
+on:
+  push:
+    branches: [verify/mhtml-corpus-sync-v2]
+permissions:
+  contents: write
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Build reconciled candidate
+        run: |
+          set -euo pipefail
+          git config user.name anydoc-ci
+          git config user.email anydoc-ci@users.noreply.github.com
+          git checkout --detach bdb9456f5f931842fe7fda6e40ae0b9243f79b3d
+          git fetch https://github.com/firecrawl/anydoc.git 75cc2d272e1db7ec73a7e0ecfbc90bc244b69fbb
+          git cherry-pick fbe5339f2eb23a64f84007bd75c873c70cc9b032..75cc2d272e1db7ec73a7e0ecfbc90bc244b69fbb
+          git diff --exit-code 75cc2d272e1db7ec73a7e0ecfbc90bc244b69fbb -- src/shared/html.rs tests/fixtures/html tests/html_corpus.rs tests/html_list.rs
+      - name: Add realistic MHTML integration regressions
+        run: |
+          cat > tests/mhtml_corpus.rs <<'RS'
+          use anydoc::model::{Block, ImageSource, Inline};
+          use anydoc::{Format, to_document, to_markdown_bytes};
+          use std::{fs, path::PathBuf};
+
+          fn fixture(name: &str) -> PathBuf {
+              PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/html").join(name)
+          }
+          fn wrap(html: &[u8], base64: bool) -> Vec<u8> {
+              let body = if base64 { b64(html) } else { String::from_utf8(html.to_vec()).unwrap() };
+              let transfer = if base64 { "Content-Transfer-Encoding: base64\r\n" } else { "" };
+              format!("From: <Saved by Blink>\r\nSnapshot-Content-Location: https://example.test/docs/page.html\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; type=\"text/html\"; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/html; charset=utf-8\r\nContent-Location: https://example.test/docs/page.html\r\n{transfer}\r\n{body}\r\n--b--\r\n").into_bytes()
+          }
+          fn b64(bytes: &[u8]) -> String {
+              const T: &[u8;64]=b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+              let mut out=String::new();
+              for c in bytes.chunks(3) {
+                  let a=c[0]; let b=c.get(1).copied().unwrap_or(0); let d=c.get(2).copied().unwrap_or(0);
+                  out.push(T[(a>>2) as usize] as char);
+                  out.push(T[(((a&3)<<4)|(b>>4)) as usize] as char);
+                  out.push(if c.len()>1 { T[(((b&15)<<2)|(d>>6)) as usize] as char } else {'='});
+                  out.push(if c.len()>2 { T[(d&63) as usize] as char } else {'='});
+              }
+              out
+          }
+          #[test]
+          fn realistic_resource_free_html_is_byte_invariant_through_mhtml() {
+              for name in ["controlled-document.html","controlled-lists.html","controlled-merged-table.html","libreoffice-docx-numbering.html","libreoffice-xlsx-merged.html"] {
+                  let html=fs::read(fixture(name)).unwrap();
+                  let standalone=to_markdown_bytes(&html,Some(Format::Html)).unwrap();
+                  let mhtml=wrap(&html,false);
+                  assert_eq!(Format::from_bytes(&mhtml),Some(Format::Mhtml),"{name}");
+                  assert_eq!(to_markdown_bytes(&mhtml,Some(Format::Mhtml)).unwrap(),standalone,"{name}");
+              }
+          }
+          #[test]
+          fn realistic_utf8_html_is_invariant_through_base64_root() {
+              let html=fs::read(fixture("controlled-document.html")).unwrap();
+              assert_eq!(to_markdown_bytes(&wrap(&html,true),Some(Format::Mhtml)).unwrap(),to_markdown_bytes(&html,Some(Format::Html)).unwrap());
+          }
+          #[test]
+          fn libreoffice_relative_images_deliberately_resolve_via_mhtml_content_location() {
+              let html=fs::read(fixture("libreoffice-docx-text.html")).unwrap();
+              let standalone=to_markdown_bytes(&html,Some(Format::Html)).unwrap();
+              let wrapped=to_markdown_bytes(&wrap(&html,false),Some(Format::Mhtml)).unwrap();
+              assert!(!standalone.contains("https://example.test/docs/text_html_c4ee90a9.png"));
+              assert!(wrapped.contains("https://example.test/docs/text_html_c4ee90a9.png"));
+              for needle in ["# Fixture Document","First numbered","Wide head","Music clef 𝄞","Persian with ZWNJ","Family emoji","[example](https://example.com/page)"] { assert!(standalone.contains(needle)); assert!(wrapped.contains(needle)); }
+          }
+          #[test]
+          fn realistic_related_css_and_image_resources_resolve() {
+              let html=fs::read_to_string(fixture("controlled-document.html")).unwrap().replace("<style>\n    .strong { font-weight: bold; }\n    .hidden { display: none; }\n  </style>","<base href=\"https://cdn.example.test/assets/\"><link rel=\"stylesheet\" href=\"styles/site.css\">").replace("</body>","<p><img alt=\"pixel\" src=\"images/pixel.png\"></p></body>");
+              let mhtml=format!("From: <Saved by Blink>\r\nSnapshot-Content-Location: https://example.test/docs/page.html\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; type=\"text/html\"; start=\"<root@id>\"; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/html; charset=utf-8\r\nContent-ID: <root@id>\r\nContent-Location: https://example.test/docs/page.html\r\n\r\n{html}\r\n--b\r\nContent-Type: text/css; charset=utf-8\r\nContent-Location: https://cdn.example.test/assets/styles/site.css\r\n\r\n.strong {{ font-weight: bold; }} .hidden {{ display: none; }}\r\n--b\r\nContent-Type: image/png\r\nContent-ID: <IMAGE@ID>\r\nContent-Location: https://cdn.example.test/assets/images/pixel.png\r\nContent-Transfer-Encoding: base64\r\n\r\nAAECAw==\r\n--b--\r\n").into_bytes();
+              let doc=to_document(&mhtml,Some(Format::Mhtml)).unwrap();
+              assert_eq!(doc.assets.len(),1);
+              assert!(doc.blocks.iter().any(|b| matches!(b,Block::Paragraph(xs) if xs.iter().any(|x| matches!(x,Inline::Image{source:ImageSource::Asset(_),..})))));
+              let md=to_markdown_bytes(&mhtml,Some(Format::Mhtml)).unwrap();
+              assert!(md.contains("**Styled bold paragraph.**")); assert!(!md.contains("drop me")); assert!(md.contains("café Ł music 𝄞 family 👨‍👩‍👧"));
+          }
+          #[test]
+          fn common_mime_variants_remain_not_mhtml() {
+              for subtype in ["mixed","alternative"] {
+                  let email=format!("MIME-Version: 1.0\r\nContent-Type: multipart/{subtype}; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/html\r\nContent-ID: <root@id>\r\n\r\n<p>email</p>\r\n--b\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment\r\n\r\ndata\r\n--b--\r\n").into_bytes();
+                  assert_eq!(Format::from_bytes(&email),None);
+              }
+          }
+          RS
+          git add tests/mhtml_corpus.rs && git commit -m "test: add realistic MHTML corpus integration coverage"
+      - name: Fix MHTML preflight ordering
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/formats/html.rs'); s=p.read_text(); old='fn preflight_html_complexity(text: &str) -> Result<(), ConvertError> {'; assert old in s; p.write_text(s.replace(old,'pub(crate) fn preflight_html_complexity(text: &str) -> Result<(), ConvertError> {',1))
+          p=Path('src/formats/mhtml.rs'); s=p.read_text(); old='    let html = super::html::decode_html_with_charset(&html_bytes, declared_charset);\n    let parsed_html = Html::parse_document(&html);'; assert old in s; p.write_text(s.replace(old,'    let html = super::html::decode_html_with_charset(&html_bytes, declared_charset);\n    super::html::preflight_html_complexity(&html)?;\n    let parsed_html = Html::parse_document(&html);',1))
+          PY
+          cat >> tests/mhtml.rs <<'RS'
+
+          #[test]
+          fn mhtml_root_enforces_html_depth_limit() {
+              let html=format!("<!doctype html>{}deep{}","<div>".repeat(300),"</div>".repeat(300));
+              let mhtml=mhtml_fixture(&format!("MIME-Version: 1.0\nContent-Type: multipart/related; type=\"text/html\"; boundary=\"b\"\n\n--b\nContent-Type: text/html; charset=utf-8\n\n{html}\n--b--\n"));
+              let error=to_markdown_bytes(&mhtml,Some(Format::Mhtml)).unwrap_err();
+              assert!(matches!(error,ConvertError::ResourceLimit{limit:"max_xml_depth",..}));
+          }
+          RS
+          cargo fmt --all
+          git add src/formats/html.rs src/formats/mhtml.rs tests/mhtml.rs && git commit -m "fix: preflight MHTML HTML roots before DOM construction"
+      - name: Specific validation
+        run: |
+          cargo test --locked --test html
+          cargo test --locked --test html_corpus
+          cargo test --locked --test html_list
+          cargo test --locked --test mhtml
+          cargo test --locked --test mhtml_corpus
+      - name: Freeze candidate
+        id: candidate
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Rust full gate
+        run: cargo fmt --all -- --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --locked
+      - name: Node full gate
+        working-directory: node
+        run: npm ci && npm run build && npm test && git diff --exit-code -- index.js index.d.ts
+      - name: WASM full gate
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo clippy -p anydoc-wasm --target wasm32-unknown-unknown -- -D warnings
+          curl -sSfL https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.15.0/wasm-pack-v0.15.0-x86_64-unknown-linux-musl.tar.gz | tar xz --strip-components=1 -C /usr/local/bin wasm-pack-v0.15.0-x86_64-unknown-linux-musl/wasm-pack
+          wasm-pack build wasm --release --target web --scope firecrawl
+          node --test wasm/test.mjs
+      - name: Python full gate
+        run: |
+          pip install maturin
+          maturin build --release --locked --manifest-path python/Cargo.toml --out dist
+          pip install --force-reinstall --no-index --find-links dist firecrawl-anydoc
+          python - <<'PY'
+          import anydoc
+          print(anydoc.__file__)
+          assert '/site-packages/' in anydoc.__file__
+          PY
+          python -m unittest discover -s python/tests
+      - name: Real MHTML fixture
+        run: |
+          git fetch origin verify/mhtml-review3-candidate
+          : > /tmp/f.b64
+          for p in .ci-fixture/mhtml.xz.b64.00 .ci-fixture/mhtml.xz.b64.01 .ci-fixture/mhtml.xz.b64.03 .ci-fixture/mhtml.xz.b64.05 .ci-fixture/mhtml.xz.b64.07 .ci-fixture/mhtml.xz.b64.09 .ci-fixture/mhtml.xz.b64.11; do git show origin/verify/mhtml-review3-candidate:$p >> /tmp/f.b64; done
+          base64 -d /tmp/f.b64 > /tmp/f.xz && xz -dc /tmp/f.xz > /tmp/f.mhtml
+          test "$(stat -c%s /tmp/f.mhtml)" = 505883
+          echo "387c6f2d7223da224a8f55962b97eac947734c97fc84888e1e5619e93745837c  /tmp/f.mhtml" | sha256sum -c -
+          python - <<'PY'
+          import anydoc,hashlib
+          raw=open('/tmp/f.mhtml','rb').read(); assert anydoc.format_from_bytes(raw)=='mhtml'; out=anydoc.to_markdown_bytes(raw); data=out.encode() if isinstance(out,str) else out; text=data.decode(); assert 'TRIBUNAL REGIONAL ELEITORAL DA PARAÍBA' in text; assert all(x not in text for x in ['�','Ã','Â']); print(len(data),hashlib.sha256(data).hexdigest()); assert len(data)==78154; assert hashlib.sha256(data).hexdigest()=='f6f75cec7bc06afe038bd89cd7967e5af358ec3562553f5bfc5c47c0299eb80c'
+          PY
+      - name: Confirm exact candidate
+        run: test "$(git rev-parse HEAD)" = "${{ steps.candidate.outputs.sha }}" && git diff --exit-code
+      - name: Publish validated candidate
+        run: git push --force origin HEAD:refs/heads/verify/mhtml-corpus-sync-candidate
