@@ -1,0 +1,20 @@
+name: Verify formatted nested list wrapper fix
+
+on:
+  push:
+    branches: [verify/html-list-wrapper-green-2]
+
+permissions:
+  contents: read
+
+jobs:
+  green:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo test --locked --test html nested_list_wrappers_preserve_structural_children -- --exact
