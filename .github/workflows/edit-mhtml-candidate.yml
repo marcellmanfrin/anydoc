@@ -1,0 +1,31 @@
+name: edit-mhtml-candidate
+
+on:
+  push:
+    branches:
+      - review/mhtml-candidate-editor
+
+permissions:
+  contents: write
+
+jobs:
+  edit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: review/mhtml-followup-candidate2
+          fetch-depth: 0
+      - name: Fetch editor script
+        run: |
+          git show origin/review/mhtml-candidate-editor:.github/scripts/edit_mhtml_candidate.py > /tmp/edit_mhtml_candidate.py
+      - name: Apply reviewed candidate changes
+        run: python /tmp/edit_mhtml_candidate.py
+      - name: Commit candidate
+        run: |
+          git config user.name "AnyDoc CI"
+          git config user.email "ci@example.invalid"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix: address Cubic HTML and MHTML findings"
+          git push origin HEAD:review/mhtml-followup-candidate2
