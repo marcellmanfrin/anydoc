@@ -70,11 +70,8 @@ impl Format {
     /// mimetype/content types). Plain-text formats (CSV) carry no signature
     /// and return `None`; so does anything unrecognized.
     pub fn from_bytes(bytes: &[u8]) -> Option<Format> {
-        if formats::mhtml::looks_like_mhtml(bytes) {
-            Some(Format::Mhtml)
-        } else {
-            formats::detect::from_bytes(bytes)
-        }
+        formats::detect::from_bytes(bytes)
+            .or_else(|| formats::mhtml::looks_like_mhtml(bytes).then_some(Format::Mhtml))
     }
 
     /// The format a bare extension names (no leading dot), matched

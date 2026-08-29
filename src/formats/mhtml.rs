@@ -5,8 +5,7 @@ use crate::model::{AnchorId, Asset, AssetId, Document, ImageSource, LinkTarget};
 use crate::package::limits;
 use crate::shared::html::HtmlCtx;
 use crate::shared::uri::is_absolute_uri;
-use mail_parser::decoders::{base64::base64_decode, quoted_printable::quoted_printable_decode};
-use mail_parser::{Encoding, Message, MessageParser, MessagePart, MimeHeaders};
+use mail_parser::{MessageParser, MessagePart, MimeHeaders};
 use scraper::Html;
 use std::collections::HashMap;
 
@@ -70,6 +69,8 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
         });
     }
 
+    preflight_base64_decoder_allocations(bytes)?;
+
     let message = MessageParser::new()
         .with_mime_headers()
         .parse(bytes)
@@ -97,17 +98,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
     }
     .ok_or_else(|| ConvertError::malformed("MHTML contains no HTML root part"))?;
 
-    let html_bytes = transfer_decoded_part_bytes(&message, html_part, "HTML root")?;
-    if html_bytes.len() as u64 > limits::MAX_ENTRY_BYTES {
-        return Err(ConvertError::ResourceLimit {
-            limit: "max_entry_bytes",
-            detail: format!(
-                "MHTML HTML root is {} bytes; maximum is {}",
-                html_bytes.len(),
-                limits::MAX_ENTRY_BYTES
-            ),
-        });
-    }
+    let html_bytes = decoded_part_bytes(html_part, "HTML root")?;
 
     let declared_charset =
         html_part.content_type().and_then(|content_type| content_type.attribute("charset"));
@@ -127,28 +118,97 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
     let (assets, image_assets) = collect_image_assets(&message.parts, resource_base.as_deref())?;
     let ctx = MhtmlCtx { image_assets, resource_base };
 
-    super::html::parse_text_with_context(&html, Some(&stylesheets), &ctx, assets)
+    super::html::document_from_parsed_html(&parsed_html, Some(&stylesheets), &ctx, assets)
 }
 
-fn transfer_decoded_part_bytes(
-    message: &Message<'_>,
-    part: &MessagePart<'_>,
-    label: &str,
-) -> Result<Vec<u8>, ConvertError> {
-    let raw = message
-        .raw_message
-        .get(part.offset_body as usize..part.offset_end as usize)
-        .ok_or_else(|| ConvertError::malformed(format!("MHTML {label} byte range is invalid")))?;
+fn preflight_base64_decoder_allocations(bytes: &[u8]) -> Result<(), ConvertError> {
+    preflight_base64_decoder_allocations_with_limit(bytes, limits::MAX_ENTRY_BYTES)
+}
 
-    match part.encoding {
-        Encoding::None => Ok(raw.to_vec()),
-        Encoding::QuotedPrintable => quoted_printable_decode(raw).ok_or_else(|| {
-            ConvertError::malformed(format!("MHTML {label} quoted-printable body is invalid"))
-        }),
-        Encoding::Base64 => base64_decode(raw).ok_or_else(|| {
-            ConvertError::malformed(format!("MHTML {label} base64 body is invalid"))
-        }),
+fn preflight_base64_decoder_allocations_with_limit(
+    bytes: &[u8],
+    max_entry_bytes: u64,
+) -> Result<(), ConvertError> {
+    let mut offset = 0usize;
+    let mut in_headers = true;
+    let mut transfer_header = false;
+    let mut transfer_is_base64 = false;
+
+    while offset < bytes.len() {
+        let newline = bytes[offset..].iter().position(|&byte| byte == b'\n');
+        let line_end = newline.map_or(bytes.len(), |index| offset + index);
+        let next_offset = newline.map_or(bytes.len(), |_| line_end + 1);
+        let mut line = &bytes[offset..line_end];
+        if line.last() == Some(&b'\r') {
+            line = &line[..line.len() - 1];
+        }
+
+        if in_headers {
+            if line.is_empty() {
+                if transfer_is_base64 {
+                    let reserve = (bytes.len().saturating_sub(next_offset) as u64 / 4)
+                        .saturating_mul(3);
+                    if reserve > max_entry_bytes {
+                        return Err(ConvertError::ResourceLimit {
+                            limit: "max_entry_bytes",
+                            detail: format!(
+                                "MHTML base64 decoder may reserve {reserve} bytes before locating the MIME boundary; maximum is {max_entry_bytes}"
+                            ),
+                        });
+                    }
+                }
+                in_headers = false;
+                transfer_header = false;
+                transfer_is_base64 = false;
+            } else if matches!(line.first(), Some(b' ' | b'\t')) {
+                if transfer_header && ascii_trim(line).eq_ignore_ascii_case(b"base64") {
+                    transfer_is_base64 = true;
+                }
+            } else if let Some(colon) = line.iter().position(|&byte| byte == b':') {
+                transfer_header = line[..colon]
+                    .eq_ignore_ascii_case(b"content-transfer-encoding");
+                transfer_is_base64 = transfer_header
+                    && ascii_trim(&line[colon + 1..]).eq_ignore_ascii_case(b"base64");
+            } else {
+                in_headers = false;
+                transfer_header = false;
+                transfer_is_base64 = false;
+            }
+        } else if line.starts_with(b"--") && line.len() > 2 {
+            in_headers = true;
+            transfer_header = false;
+            transfer_is_base64 = false;
+        }
+
+        offset = next_offset;
     }
+
+    Ok(())
+}
+
+fn ascii_trim(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+fn decoded_part_bytes(part: &MessagePart<'_>, label: &str) -> Result<Vec<u8>, ConvertError> {
+    let bytes = part.contents();
+    if bytes.len() as u64 > limits::MAX_ENTRY_BYTES {
+        return Err(ConvertError::ResourceLimit {
+            limit: "max_entry_bytes",
+            detail: format!(
+                "MHTML {label} is {} bytes; maximum is {}",
+                bytes.len(),
+                limits::MAX_ENTRY_BYTES
+            ),
+        });
+    }
+    Ok(bytes.to_vec())
 }
 
 fn html_resource_base(parsed: &Html, root_location: Option<&str>) -> Option<String> {
@@ -435,5 +495,25 @@ impl HtmlCtx for MhtmlCtx {
 
     fn anchor_id(&self, raw: &str) -> AnchorId {
         raw.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_decoder_preflight_rejects_large_reserve_before_mime_parse() {
+        let input = b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/html\r\nContent-Transfer-Encoding: base64\r\n\r\nQQ==\r\n--b\r\nContent-Type: text/plain\r\n\r\n0123456789abcdef\r\n--b--\r\n";
+        assert!(matches!(
+            preflight_base64_decoder_allocations_with_limit(input, 8),
+            Err(ConvertError::ResourceLimit { limit: "max_entry_bytes", .. })
+        ));
+    }
+
+    #[test]
+    fn base64_decoder_preflight_allows_small_remaining_input() {
+        let input = b"Content-Transfer-Encoding: base64\r\n\r\nQQ==\r\n";
+        assert!(preflight_base64_decoder_allocations_with_limit(input, 64).is_ok());
     }
 }
