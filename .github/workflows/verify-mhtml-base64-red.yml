@@ -1,0 +1,20 @@
+name: verify-mhtml-base64-red
+
+on:
+  push:
+    branches:
+      - review/mhtml-base64-red
+
+permissions:
+  contents: read
+
+jobs:
+  red:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: a1ec87090a11893bfbf5782e8f2636cb6be755a2
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run base64 allocation regression
+        run: cargo test --test mhtml_base64_alloc_red -- --nocapture
