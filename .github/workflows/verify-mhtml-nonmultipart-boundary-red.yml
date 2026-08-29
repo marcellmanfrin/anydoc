@@ -1,0 +1,43 @@
+name: verify-mhtml-nonmultipart-boundary-red
+on:
+  push:
+    branches:
+      - verify/mhtml-nonmultipart-boundary-red
+permissions:
+  contents: read
+jobs:
+  red:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify exact candidate
+        run: test "$(git rev-parse HEAD^)" = "c5e79829bf590d8ba147e2d4aaa020388b3ef86b"
+      - name: Create regression
+        run: |
+          cat > tests/mhtml_nonmultipart_boundary_red.rs <<'RS'
+          use anydoc::{Format, to_markdown_bytes};
+
+          #[test]
+          fn non_multipart_boundary_parameter_does_not_create_mime_nesting() {
+              let mut mhtml = String::from(
+                  "MIME-Version: 1.0\r\nSnapshot-Content-Location: https://example.test/page\r\nContent-Type: multipart/related; boundary=\"outer\"\r\n\r\n--outer\r\nContent-Type: text/plain; boundary=\"fake0\"\r\n\r\n",
+              );
+              for depth in 0..70 {
+                  mhtml.push_str(&format!(
+                      "--fake{depth}\r\nContent-Type: text/plain; boundary=\"fake{}\"\r\n\r\n",
+                      depth + 1
+                  ));
+              }
+              mhtml.push_str(
+                  "payload\r\n--outer\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<!doctype html><p>ok</p>\r\n--outer--\r\n",
+              );
+
+              assert_eq!(
+                  to_markdown_bytes(mhtml.as_bytes(), Some(Format::Mhtml)).unwrap(),
+                  "ok\n"
+              );
+          }
+          RS
+      - name: Run RED regression
+        run: cargo test --locked --test mhtml_nonmultipart_boundary_red -- --nocapture
