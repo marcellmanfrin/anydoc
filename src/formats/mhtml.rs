@@ -146,8 +146,8 @@ fn preflight_base64_decoder_allocations_with_limit(
         if in_headers {
             if line.is_empty() {
                 if transfer_is_base64 {
-                    let reserve = (bytes.len().saturating_sub(next_offset) as u64 / 4)
-                        .saturating_mul(3);
+                    let reserve =
+                        (bytes.len().saturating_sub(next_offset) as u64 / 4).saturating_mul(3);
                     if reserve > max_entry_bytes {
                         return Err(ConvertError::ResourceLimit {
                             limit: "max_entry_bytes",
@@ -165,8 +165,7 @@ fn preflight_base64_decoder_allocations_with_limit(
                     transfer_is_base64 = true;
                 }
             } else if let Some(colon) = line.iter().position(|&byte| byte == b':') {
-                transfer_header = line[..colon]
-                    .eq_ignore_ascii_case(b"content-transfer-encoding");
+                transfer_header = line[..colon].eq_ignore_ascii_case(b"content-transfer-encoding");
                 transfer_is_base64 = transfer_header
                     && ascii_trim(&line[colon + 1..]).eq_ignore_ascii_case(b"base64");
             } else {
