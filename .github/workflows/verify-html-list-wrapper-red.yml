@@ -1,0 +1,17 @@
+name: Verify nested list wrapper red phase
+
+on:
+  push:
+    branches: [verify/html-list-wrapper-red]
+
+permissions:
+  contents: read
+
+jobs:
+  red:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --test html nested_list_wrappers_preserve_structural_children -- --exact
