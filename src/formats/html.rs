@@ -239,7 +239,7 @@ fn close_implied_before_start(open: &mut Vec<LocalName>, name: &str) {
     if name == "a"
         && let Some(position) = open.iter().rposition(|candidate| candidate.as_ref() == "a")
     {
-        open.truncate(position);
+        open.remove(position);
     }
 
     if is_heading_element(name)
