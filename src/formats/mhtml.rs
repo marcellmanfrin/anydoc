@@ -130,70 +130,140 @@ fn preflight_base64_decoder_allocations_with_limit(
     bytes: &[u8],
     max_entry_bytes: u64,
 ) -> Result<(), ConvertError> {
-    let mut offset = 0usize;
-    let mut in_headers = true;
-    let mut transfer_header = false;
-    let mut transfer_is_base64 = false;
+    let Some((_, body_start)) = mime_header_body_start(bytes, 0, bytes.len()) else {
+        return Ok(());
+    };
+    let headers = &bytes[..body_start];
 
-    while offset < bytes.len() {
-        let newline = bytes[offset..].iter().position(|&byte| byte == b'\n');
-        let line_end = newline.map_or(bytes.len(), |index| offset + index);
-        let next_offset = newline.map_or(bytes.len(), |_| line_end + 1);
-        let mut line = &bytes[offset..line_end];
-        if line.last() == Some(&b'\r') {
-            line = &line[..line.len() - 1];
+    if headers_use_base64(headers) {
+        enforce_base64_parser_reserve(bytes.len().saturating_sub(body_start), max_entry_bytes)?;
+    }
+
+    let Some(boundary) = mime_boundary_from_headers(headers) else {
+        return Ok(());
+    };
+    preflight_multipart_base64(bytes, body_start, bytes.len(), &boundary, max_entry_bytes)
+}
+
+fn preflight_multipart_base64(
+    bytes: &[u8],
+    mut offset: usize,
+    end: usize,
+    boundary: &[u8],
+    max_entry_bytes: u64,
+) -> Result<(), ConvertError> {
+    let mut marker = Vec::with_capacity(boundary.len() + 2);
+    marker.extend_from_slice(b"--");
+    marker.extend_from_slice(boundary);
+
+    while offset < end {
+        let Some(marker_offset) = find_bytes(&bytes[offset..end], &marker) else {
+            break;
+        };
+        let marker_start = offset + marker_offset;
+        let marker_end = marker_start + marker.len();
+        if bytes.get(marker_end..marker_end + 2) == Some(b"--") {
+            break;
         }
 
-        if in_headers {
-            if line.is_empty() {
-                if transfer_is_base64 {
-                    let reserve =
-                        (bytes.len().saturating_sub(next_offset) as u64 / 4).saturating_mul(3);
-                    if reserve > max_entry_bytes {
-                        return Err(ConvertError::ResourceLimit {
-                            limit: "max_entry_bytes",
-                            detail: format!(
-                                "MHTML base64 decoder may reserve {reserve} bytes before locating the MIME boundary; maximum is {max_entry_bytes}"
-                            ),
-                        });
-                    }
-                }
-                in_headers = false;
-                transfer_header = false;
-                transfer_is_base64 = false;
-            } else if matches!(line.first(), Some(b' ' | b'\t')) {
-                if transfer_header && ascii_trim(line).eq_ignore_ascii_case(b"base64") {
-                    transfer_is_base64 = true;
-                }
-            } else if let Some(colon) = line.iter().position(|&byte| byte == b':') {
-                transfer_header = line[..colon].eq_ignore_ascii_case(b"content-transfer-encoding");
-                transfer_is_base64 = transfer_header
-                    && ascii_trim(&line[colon + 1..]).eq_ignore_ascii_case(b"base64");
-            } else {
-                in_headers = false;
-                transfer_header = false;
-                transfer_is_base64 = false;
-            }
-        } else if line.starts_with(b"--") && line.len() > 2 {
-            in_headers = true;
-            transfer_header = false;
-            transfer_is_base64 = false;
+        let headers_start = skip_boundary_line(bytes, marker_end, end);
+        let Some((_, body_start)) = mime_header_body_start(bytes, headers_start, end) else {
+            break;
+        };
+        let headers = &bytes[headers_start..body_start];
+
+        if headers_use_base64(headers) {
+            // mail-parser 0.11.x reserves from MessageStream::remaining() before it scans
+            // for the active MIME boundary, so the safe upper bound is deliberately the
+            // entire remaining message rather than only this part's encoded body.
+            enforce_base64_parser_reserve(
+                bytes.len().saturating_sub(body_start),
+                max_entry_bytes,
+            )?;
         }
 
-        offset = next_offset;
+        let next_parent = find_bytes(&bytes[body_start..end], &marker)
+            .map_or(end, |next| body_start + next);
+        if let Some(nested_boundary) = mime_boundary_from_headers(headers) {
+            preflight_multipart_base64(
+                bytes,
+                body_start,
+                next_parent,
+                &nested_boundary,
+                max_entry_bytes,
+            )?;
+        }
+        offset = next_parent;
     }
 
     Ok(())
 }
 
-fn ascii_trim(mut bytes: &[u8]) -> &[u8] {
-    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
-        bytes = &bytes[1..];
+fn enforce_base64_parser_reserve(
+    remaining: usize,
+    max_entry_bytes: u64,
+) -> Result<(), ConvertError> {
+    let reserve = (remaining as u64 / 4).saturating_mul(3);
+    if reserve > max_entry_bytes {
+        return Err(ConvertError::ResourceLimit {
+            limit: "max_entry_bytes",
+            detail: format!(
+                "MHTML base64 decoder may reserve {reserve} bytes before locating the MIME boundary; maximum is {max_entry_bytes}"
+            ),
+        });
     }
-    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
-        bytes = &bytes[..bytes.len() - 1];
+    Ok(())
+}
+
+fn mime_header_body_start(bytes: &[u8], start: usize, end: usize) -> Option<(usize, usize)> {
+    let slice = bytes.get(start..end)?;
+    let crlf = slice.windows(4).position(|window| window == b"\r\n\r\n");
+    let lf = slice.windows(2).position(|window| window == b"\n\n");
+    match (crlf, lf) {
+        (Some(a), Some(b)) if a <= b => Some((start + a, start + a + 4)),
+        (Some(a), Some(b)) => Some((start + b, start + b + 2)),
+        (Some(a), None) => Some((start + a, start + a + 4)),
+        (None, Some(b)) => Some((start + b, start + b + 2)),
+        (None, None) => None,
     }
-    bytes
+}
+
+fn mime_boundary_from_headers(headers: &[u8]) -> Option<Vec<u8>> {
+    MessageParser::new()
+        .with_mime_headers()
+        .parse_headers(headers)?
+        .content_type()?
+        .attribute("boundary")
+        .map(|boundary| boundary.as_bytes().to_vec())
+}
+
+fn headers_use_base64(headers: &[u8]) -> bool {
+    unfold_headers(headers).lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("content-transfer-encoding")
+                && value.trim().eq_ignore_ascii_case("base64")
+        })
+    })
+}
+
+fn skip_boundary_line(bytes: &[u8], mut offset: usize, end: usize) -> usize {
+    while offset < end {
+        match bytes[offset] {
+            b'\r' | b' ' | b'\t' => offset += 1,
+            b'\n' => {
+                offset += 1;
+                break;
+            }
+            _ => break,
+        }
+    }
+    offset
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    (!needle.is_empty() && needle.len() <= haystack.len())
+        .then(|| haystack.windows(needle.len()).position(|window| window == needle))
+        .flatten()
 }
 
 fn transfer_decoded_part_bytes(
@@ -560,5 +630,20 @@ mod tests {
     fn base64_decoder_preflight_allows_small_remaining_input() {
         let input = b"Content-Transfer-Encoding: base64\r\n\r\nQQ==\r\n";
         assert!(preflight_base64_decoder_allocations_with_limit(input, 64).is_ok());
+    }
+
+    #[test]
+    fn base64_decoder_preflight_matches_embedded_boundary_semantics() {
+        let input = b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"b\"\r\n\r\npreamblexx--b\r\nContent-Type: text/html\r\nContent-Transfer-Encoding: base64\r\n\r\nQQ==\r\n0123456789abcdef\r\n--b--\r\n";
+        assert!(matches!(
+            preflight_base64_decoder_allocations_with_limit(input, 8),
+            Err(ConvertError::ResourceLimit { limit: "max_entry_bytes", .. })
+        ));
+    }
+
+    #[test]
+    fn base64_decoder_preflight_ignores_non_boundary_dashes_in_body_text() {
+        let input = b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"real\"\r\n\r\n--real\r\nContent-Type: text/plain\r\n\r\nbody --not-real Content-Transfer-Encoding: base64\r\n\r\n0123456789abcdef\r\n--real--\r\n";
+        assert!(preflight_base64_decoder_allocations_with_limit(input, 8).is_ok());
     }
 }
