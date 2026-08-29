@@ -1,0 +1,54 @@
+name: review-followup-green
+on:
+  push:
+    branches:
+      - review/mhtml-followup-red
+permissions:
+  contents: write
+jobs:
+  green:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Construct functional candidate
+        run: |
+          git checkout --detach 7b807c6451d171a2dbaaf3c64442bc60960ef20e
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/formats/mhtml.rs')
+          text = path.read_text()
+          old = '''        if !id.is_empty() {\n            keys.push(format!("cid:{id}"));\n            keys.push(id);\n        }'''
+          new = '''        if !id.is_empty() {\n            keys.push(format!("cid:{id}"));\n        }'''
+          assert old in text
+          text = text.replace(old, new, 1)
+          old = '''        let location = resolve_resource_reference(resource_base, location);\n        if !location.is_empty() && !keys.contains(&location) {\n            keys.push(location);\n        }'''
+          new = '''        let location = resolve_resource_reference(resource_base, location);\n        let location = resource_lookup_key(&location).to_owned();\n        if !location.is_empty() && !keys.contains(&location) {\n            keys.push(location);\n        }'''
+          assert old in text
+          text = text.replace(old, new, 1)
+          path.write_text(text)
+
+          path = Path('src/formats/html.rs')
+          text = path.read_text()
+          needle = '''fn close_implied_before_start(open: &mut Vec<LocalName>, name: &str) {\n    if is_heading_element(name)'''
+          replacement = '''fn close_implied_before_start(open: &mut Vec<LocalName>, name: &str) {\n    if name == "a"\n        && let Some(position) = open.iter().rposition(|candidate| candidate.as_ref() == "a")\n    {\n        open.truncate(position);\n    }\n\n    if is_heading_element(name)'''
+          assert needle in text
+          text = text.replace(needle, replacement, 1)
+          path.write_text(text)
+          PY
+          git add src/formats/mhtml.rs src/formats/html.rs tests/review_followup.rs
+          git -c user.name='AnyDoc CI' -c user.email='ci@example.invalid' commit -m 'fix: address remaining HTML and MHTML review findings'
+          echo "CANDIDATE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Run targeted regressions
+        run: cargo test --locked --test review_followup -- --nocapture
+      - name: Run affected suites
+        run: |
+          cargo test --locked --test html
+          cargo test --locked --test mhtml
+          cargo test --locked --test mhtml_charset
+          cargo test --locked --test mhtml_corpus
+      - name: Publish candidate
+        run: git push --force origin HEAD:refs/heads/review/mhtml-followup-candidate
