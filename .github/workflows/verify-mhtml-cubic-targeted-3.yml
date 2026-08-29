@@ -1,0 +1,98 @@
+name: verify-mhtml-cubic-targeted-3
+
+on:
+  push:
+    branches:
+      - verify/mhtml-cubic-targeted-3
+
+permissions:
+  contents: read
+
+jobs:
+  targeted:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 6901fe11190b299978d9d0af9a57734355b0aee1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Verify candidate identity
+        run: test "$(git rev-parse HEAD)" = "6901fe11190b299978d9d0af9a57734355b0aee1"
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+      - name: Anchor structural-depth regression
+        run: cargo test nested_anchor_repair_preserves_structural_depth_in_preflight --lib -- --nocapture
+      - name: Base64 preflight unit regressions
+        run: cargo test base64_decoder_preflight --lib -- --nocapture
+      - name: Format detection regression
+        run: cargo test --test format_detection -- --nocapture
+      - name: HTML preflight regression
+        run: cargo test --test html_preflight -- --nocapture
+      - name: HTML affected suites
+        run: |
+          cargo test --test html
+          cargo test --test html_corpus
+          cargo test --test html_list
+      - name: MHTML affected suites
+        run: |
+          cargo test --test mhtml
+          cargo test --test mhtml_charset
+          cargo test --test mhtml_corpus
+          cargo test --test mhtml_resources
+      - name: Create allocation diagnostic regression
+        run: |
+          cat > tests/mhtml_base64_alloc_red.rs <<'RS'
+          use anydoc::{Format, to_markdown_bytes};
+          use std::alloc::{GlobalAlloc, Layout, System};
+          use std::sync::atomic::{AtomicUsize, Ordering};
+
+          struct TrackingAllocator;
+          static MAX_ALLOCATION: AtomicUsize = AtomicUsize::new(0);
+
+          unsafe impl GlobalAlloc for TrackingAllocator {
+              unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                  MAX_ALLOCATION.fetch_max(layout.size(), Ordering::Relaxed);
+                  unsafe { System.alloc(layout) }
+              }
+
+              unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                  unsafe { System.dealloc(ptr, layout) }
+              }
+
+              unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                  MAX_ALLOCATION.fetch_max(new_size, Ordering::Relaxed);
+                  unsafe { System.realloc(ptr, layout, new_size) }
+              }
+          }
+
+          #[global_allocator]
+          static ALLOCATOR: TrackingAllocator = TrackingAllocator;
+
+          #[test]
+          fn base64_mime_parse_does_not_allocate_above_entry_limit_before_rejection() {
+              const MAX_ENTRY_BYTES: usize = 128 * 1024 * 1024;
+              const TRAILING_BYTES: usize = 180 * 1024 * 1024;
+
+              let mut mhtml = Vec::with_capacity(TRAILING_BYTES + 1024);
+              mhtml.extend_from_slice(
+                  b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\nPHA+b2s8L3A+\r\n--b\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n",
+              );
+              mhtml.resize(mhtml.len() + TRAILING_BYTES, b'x');
+              mhtml.extend_from_slice(b"\r\n--b--\r\n");
+
+              MAX_ALLOCATION.store(0, Ordering::Relaxed);
+              let _ = to_markdown_bytes(&mhtml, Some(Format::Mhtml));
+              let largest = MAX_ALLOCATION.load(Ordering::Relaxed);
+
+              assert!(
+                  largest <= MAX_ENTRY_BYTES,
+                  "MHTML parsing allocated {largest} bytes before enforcing max_entry_bytes"
+              );
+          }
+          RS
+      - name: Base64 allocation regression
+        run: cargo test --test mhtml_base64_alloc_red -- --nocapture
+      - name: Clippy affected candidate
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
