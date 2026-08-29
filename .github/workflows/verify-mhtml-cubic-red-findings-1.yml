@@ -1,0 +1,119 @@
+name: verify-mhtml-cubic-red-findings-1
+
+on:
+  push:
+    branches:
+      - verify/mhtml-cubic-red-findings-1
+
+permissions:
+  contents: read
+
+jobs:
+  base64-boundary-red:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 6901fe11190b299978d9d0af9a57734355b0aee1
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify candidate identity
+        run: test "$(git rev-parse HEAD)" = "6901fe11190b299978d9d0af9a57734355b0aee1"
+      - name: Create Cubic P0 allocation regression
+        run: |
+          cat > tests/mhtml_boundary_alloc_red.rs <<'RS'
+          use anydoc::{Format, to_markdown_bytes};
+          use std::alloc::{GlobalAlloc, Layout, System};
+          use std::sync::atomic::{AtomicUsize, Ordering};
+
+          struct TrackingAllocator;
+          static MAX_ALLOCATION: AtomicUsize = AtomicUsize::new(0);
+
+          unsafe impl GlobalAlloc for TrackingAllocator {
+              unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                  MAX_ALLOCATION.fetch_max(layout.size(), Ordering::Relaxed);
+                  unsafe { System.alloc(layout) }
+              }
+
+              unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                  unsafe { System.dealloc(ptr, layout) }
+              }
+
+              unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                  MAX_ALLOCATION.fetch_max(new_size, Ordering::Relaxed);
+                  unsafe { System.realloc(ptr, layout, new_size) }
+              }
+          }
+
+          #[global_allocator]
+          static ALLOCATOR: TrackingAllocator = TrackingAllocator;
+
+          #[test]
+          fn parser_accepted_embedded_boundary_cannot_bypass_base64_allocation_guard() {
+              const MAX_ENTRY_BYTES: usize = 128 * 1024 * 1024;
+              const TRAILING_BYTES: usize = 180 * 1024 * 1024;
+
+              let mut mhtml = Vec::with_capacity(TRAILING_BYTES + 1024);
+              mhtml.extend_from_slice(
+                  b"MIME-Version: 1.0\r\nSnapshot-Content-Location: https://example.test/\r\nContent-Type: multipart/related; boundary=\"b\"\r\n\r\npreamblexx--b\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\nPHA+b2s8L3A+\r\n",
+              );
+              mhtml.resize(mhtml.len() + TRAILING_BYTES, b'A');
+              mhtml.extend_from_slice(b"\r\n--b--\r\n");
+
+              MAX_ALLOCATION.store(0, Ordering::Relaxed);
+              let _ = to_markdown_bytes(&mhtml, Some(Format::Mhtml));
+              let largest = MAX_ALLOCATION.load(Ordering::Relaxed);
+
+              assert!(
+                  largest <= MAX_ENTRY_BYTES,
+                  "parser-accepted embedded MIME boundary bypassed the guard and allocated {largest} bytes"
+              );
+          }
+          RS
+      - name: Run Cubic P0 RED
+        run: cargo test --test mhtml_boundary_alloc_red -- --nocapture
+
+  pdf-precedence-red:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 6901fe11190b299978d9d0af9a57734355b0aee1
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify candidate identity
+        run: test "$(git rev-parse HEAD)" = "6901fe11190b299978d9d0af9a57734355b0aee1"
+      - name: Create Cubic P2 detection regression
+        run: |
+          cat > tests/mhtml_pdf_detection_red.rs <<'RS'
+          use anydoc::Format;
+
+          #[test]
+          fn valid_mhtml_wins_over_pdf_marker_in_mime_preamble() {
+              let mhtml = b"MIME-Version: 1.0\r\nSnapshot-Content-Location: https://example.test/page\r\nContent-Type: multipart/related; boundary=\"b\"\r\n\r\n%PDF-1.7 is ordinary MIME preamble text\r\n--b\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<!doctype html><p>ok</p>\r\n--b--\r\n";
+              assert_eq!(Format::from_bytes(mhtml), Some(Format::Mhtml));
+          }
+          RS
+      - name: Run Cubic P2 RED
+        run: cargo test --test mhtml_pdf_detection_red -- --nocapture
+
+  table-output-diagnostic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 6901fe11190b299978d9d0af9a57734355b0aee1
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Print exact HTML export markdown
+        run: |
+          cat > tests/html_export_output_diagnostic.rs <<'RS'
+          use anydoc::to_markdown;
+          use std::path::PathBuf;
+
+          #[test]
+          fn print_libreoffice_merged_export_markdown() {
+              let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                  .join("tests/fixtures/html/libreoffice-xlsx-merged.html");
+              let markdown = to_markdown(path).unwrap();
+              println!("OUTPUT={markdown:?}");
+          }
+          RS
+          cargo test --test html_export_output_diagnostic -- --nocapture
