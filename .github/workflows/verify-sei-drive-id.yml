@@ -1,0 +1,41 @@
+name: Identify SEI Drive file id
+on:
+  push:
+    branches: [verify/sei-drive-id]
+jobs:
+  identify:
+    runs-on: ubuntu-24.04
+    env:
+      VALIDATION: ${{ secrets.ANYDOC_VALIDATION_FIXTURE_URL }}
+    steps:
+      - name: Extract only Drive file IDs
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import html, os, re, urllib.parse, urllib.request
+          base = os.environ['VALIDATION']
+          values = [base]
+          try:
+              r = urllib.request.urlopen(base, timeout=20)
+              values.extend([r.geturl(), r.read().decode('utf-8', errors='replace')])
+          except Exception:
+              pass
+          expanded=[]
+          for value in values:
+              x=html.unescape(value)
+              expanded.append(x)
+              for _ in range(3):
+                  x=urllib.parse.unquote(x)
+                  expanded.append(x)
+          ids=[]
+          patterns=[r'/d/([A-Za-z0-9_-]{20,})', r'[?&]id=([A-Za-z0-9_-]{20,})', r'/file/([A-Za-z0-9_-]{20,})']
+          for value in expanded:
+              for pat in patterns:
+                  for m in re.finditer(pat, value):
+                      fid=m.group(1)
+                      if fid not in ids:
+                          ids.append(fid)
+          print('drive_id_count=',len(ids))
+          for i,fid in enumerate(ids[:20]):
+              print(f'drive_id_{i}={fid}')
+          PY
