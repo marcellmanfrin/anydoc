@@ -588,3 +588,12 @@ Content-Type: text/html; charset=utf-8
         matches!(&document.blocks[0], Block::Paragraph(inlines) if matches!(&inlines[0], Inline::Image { source: ImageSource::External(url), .. } if url == "//cdn.example.test/image.png"))
     );
 }
+#[test]
+fn mhtml_root_enforces_html_depth_limit() {
+    let html = format!("<!doctype html>{}deep{}", "<div>".repeat(300), "</div>".repeat(300));
+    let mhtml = mhtml_fixture(&format!(
+        "MIME-Version: 1.0\nContent-Type: multipart/related; type=\"text/html\"; boundary=\"b\"\n\n--b\nContent-Type: text/html; charset=utf-8\n\n{html}\n--b--\n"
+    ));
+    let error = to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap_err();
+    assert!(matches!(error, ConvertError::ResourceLimit { limit: "max_xml_depth", .. }));
+}

@@ -354,7 +354,7 @@ fn is_void_html_element(name: &str) -> bool {
     )
 }
 
-fn preflight_html_complexity(text: &str) -> Result<(), ConvertError> {
+pub(crate) fn preflight_html_complexity(text: &str) -> Result<(), ConvertError> {
     const CHUNK_BYTES: usize = 64 * 1024;
     let tokenizer = Tokenizer::new(HtmlComplexitySink::default(), Default::default());
     let input = BufferQueue::default();

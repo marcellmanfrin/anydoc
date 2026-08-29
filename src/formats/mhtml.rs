@@ -112,6 +112,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
     let declared_charset =
         html_part.content_type().and_then(|content_type| content_type.attribute("charset"));
     let html = super::html::decode_html_with_charset(&html_bytes, declared_charset);
+    super::html::preflight_html_complexity(&html)?;
     let parsed_html = Html::parse_document(&html);
     let root_location = html_part.content_location();
     let resource_base = html_resource_base(&parsed_html, root_location);
