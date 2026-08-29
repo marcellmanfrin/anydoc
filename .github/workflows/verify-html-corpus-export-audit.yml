@@ -1,0 +1,44 @@
+name: Verify HTML corpus export audit
+
+on:
+  push:
+    branches: [verify/html-corpus-export-audit]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install LibreOffice
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-writer libreoffice-calc
+      - name: Export selected corpus documents to HTML
+        run: |
+          set -euxo pipefail
+          mkdir -p out
+          soffice --headless --convert-to html --outdir out tests/fixtures/docx/text.docx
+          soffice --headless --convert-to html --outdir out tests/fixtures/docx/handmade-numbering.docx
+          soffice --headless --convert-to html --outdir out tests/fixtures/odt/handmade-lists.odt
+          soffice --headless --convert-to html --outdir out tests/fixtures/xlsx/handmade-merged.xlsx
+          find out -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+          sha256sum out/* | sort
+          for html in out/*.html; do
+            echo "=== $html ==="
+            printf 'headings='; grep -Eio '<h[1-6][ >]' "$html" | wc -l
+            printf 'tables='; grep -Eio '<table[ >]' "$html" | wc -l
+            printf 'links='; grep -Eio '<a[ >]' "$html" | wc -l
+            printf 'lists='; grep -Eio '<(ul|ol)[ >]' "$html" | wc -l
+            printf 'colspan='; grep -Eio 'colspan=' "$html" | wc -l
+            printf 'rowspan='; grep -Eio 'rowspan=' "$html" | wc -l
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: html-corpus-exports
+          path: out/
+          if-no-files-found: error
+          retention-days: 1
