@@ -1,6 +1,7 @@
 name: Verify MHTML sync #147
 on:
-  workflow_dispatch:
+  push:
+    branches: [verify/mhtml-sync147-fbe5339]
 permissions:
   contents: write
 jobs:
