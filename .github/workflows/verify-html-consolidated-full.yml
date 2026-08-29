@@ -1,0 +1,163 @@
+name: Verify HTML consolidated full gate
+
+on:
+  push:
+    branches: [verify/html-consolidated-full]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust + explicit HTML audit + real fixture
+    runs-on: ubuntu-24.04
+    env:
+      ANYDOC_VALIDATION_FIXTURE_URL: ${{ secrets.ANYDOC_VALIDATION_FIXTURE_URL }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Explicit HTML audit regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --test html html_doctype_is_detected_from_content
+          cargo test --locked --test html utf16_html_is_detected_from_content
+          cargo test --locked --test html utf16_html_detection_allows_long_leading_whitespace
+          cargo test --locked --test html utf16le_doctype_allows_long_whitespace_between_keyword_and_name
+          cargo test --locked --test html utf16be_doctype_allows_long_whitespace_between_keyword_and_name
+          cargo test --locked --test html meta_charset_decodes_legacy_html
+          cargo test --locked --test html meta_charset_after_first_kib_is_still_honored
+          cargo test --locked --test html quoted_mime_parameter_semicolon_does_not_fake_charset
+          cargo test --locked --test html malformed_html5_is_repaired_before_conversion
+          cargo test --locked --test html optional_li_end_tags_do_not_count_as_nested_depth
+          cargo test --locked --test html optional_p_end_tags_do_not_count_as_nested_depth
+          cargo test --locked --test html alternating_headings_are_implicitly_closed_before_preflight_depth_counting
+          cargo test --locked --test html protocol_relative_image_is_preserved_as_external
+          cargo test --locked --test html pdf_header_before_html_marker_remains_pdf
+          cargo test --locked --test html html_prefix_wins_over_embedded_pdf_marker
+          cargo test --locked --test html style_blocks_feed_the_existing_semantic_css_subset
+          cargo test --locked --test html html_node_limit_covers_nodes_outside_body_before_dom_materialization
+          cargo test --locked --test html non_void_self_closing_html_tags_still_count_toward_preflight_depth
+      - name: Full HTML regression suite
+        run: cargo test --locked --test html
+      - name: Full Rust suite
+        run: cargo test --locked
+      - name: Validate HTML root extracted from original SEI MHTML
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANYDOC_VALIDATION_FIXTURE_URL"
+          curl -fsSL "$ANYDOC_VALIDATION_FIXTURE_URL" -o /tmp/fixture.mhtml
+          echo "387c6f2d7223da224a8f55962b97eac947734c97fc84888e1e5619e93745837c  /tmp/fixture.mhtml" | sha256sum -c -
+          python3 - <<'PY'
+          from email import policy
+          from email.parser import BytesParser
+          from pathlib import Path
+
+          source = Path('/tmp/fixture.mhtml').read_bytes()
+          message = BytesParser(policy=policy.default).parsebytes(source)
+          html_parts = [part for part in message.walk() if part.get_content_type() == 'text/html']
+          if len(html_parts) != 1:
+              raise SystemExit(f'expected exactly one text/html part, found {len(html_parts)}')
+          payload = html_parts[0].get_payload(decode=True)
+          Path('/tmp/root.html').write_bytes(payload)
+          PY
+          echo "32fca03d52dc62518bf4419e2a4b1be96160195cd99f613a2d3230f1bb1e817c  /tmp/root.html" | sha256sum -c -
+          test "$(wc -c < /tmp/root.html)" -eq 200381
+          cargo run --locked --example convert -- /tmp/root.html -f html -o /tmp/root.md
+          test -s /tmp/root.md
+          test "$(wc -c < /tmp/root.md)" -eq 78154
+          echo "6119ae4bb085acabe21149492020e159e431de4f7a169350b1b619f2add61c1a  /tmp/root.md" | sha256sum -c -
+          grep -F "TRIBUNAL REGIONAL ELEITORAL DA PARAÍBA" /tmp/root.md >/dev/null
+          grep -F "Estudos Técnicos Preliminares" /tmp/root.md >/dev/null
+          for bad in '�' 'Ã' 'Â'; do
+            if grep -F "$bad" /tmp/root.md >/dev/null; then
+              echo "mojibake marker found in real HTML conversion: $bad" >&2
+              exit 1
+            fi
+          done
+          printf 'mhtml-bytes='; wc -c < /tmp/fixture.mhtml
+          printf 'html-bytes='; wc -c < /tmp/root.html
+          printf 'markdown-bytes='; wc -c < /tmp/root.md
+          sha256sum /tmp/root.md
+
+  msrv:
+    name: Rust MSRV 1.88
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.88
+      - run: cargo check --locked
+      - run: cargo test --locked --test html --no-run
+
+  node:
+    name: Node bindings
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: node/package-lock.json
+      - run: npm ci
+        working-directory: node
+      - run: npm run build
+        working-directory: node
+      - run: npm test
+        working-directory: node
+      - name: Committed bindings are up to date
+        run: |
+          if ! git diff --exit-code -- node/index.js node/index.d.ts; then
+            echo "::error::node/index.js or node/index.d.ts is out of date. Run 'npm run build' in node/ and commit the result."
+            exit 1
+          fi
+
+  wasm:
+    name: Wasm bindings
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32-unknown-unknown
+      - run: cargo clippy -p anydoc-wasm --target wasm32-unknown-unknown -- -D warnings
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+      - name: Install wasm-pack
+        run: >
+          curl -sSfL https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.15.0/wasm-pack-v0.15.0-x86_64-unknown-linux-musl.tar.gz
+          | tar xz --strip-components=1 -C /usr/local/bin wasm-pack-v0.15.0-x86_64-unknown-linux-musl/wasm-pack
+      - run: wasm-pack build wasm --release --target web --scope firecrawl
+      - run: node --test wasm/test.mjs
+
+  python:
+    name: Python bindings
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: pip install maturin
+      - run: maturin build --release --locked --manifest-path python/Cargo.toml --out dist
+      - run: pip install --no-index --find-links dist firecrawl-anydoc
+      - run: python -m unittest discover -s python/tests
