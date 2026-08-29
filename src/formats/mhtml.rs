@@ -156,6 +156,7 @@ fn html_resource_base(parsed: &Html, root_location: Option<&str>) -> Option<Stri
         .find(|element| element.value().name() == "base")
         .and_then(|element| element.value().attr("href"))
         .map(|href| resolve_resource_reference(root_location, href))
+        .filter(|base| !base.is_empty())
         .or_else(|| root_location.map(canonical_reference))
 }
 
@@ -196,7 +197,8 @@ fn collect_stylesheets_in_order(
                     continue;
                 };
                 let reference = resolve_resource_reference(resource_base, href);
-                let Some(&part_index) = resource_index.get(&reference) else {
+                let lookup = resource_lookup_key(&reference);
+                let Some(&part_index) = resource_index.get(lookup) else {
                     continue;
                 };
                 let part = &parts[part_index];
@@ -367,6 +369,10 @@ fn split_path_suffix(value: &str) -> (&str, &str) {
     index.map_or((value, ""), |index| value.split_at(index))
 }
 
+fn resource_lookup_key(reference: &str) -> &str {
+    reference.split_once('#').map_or(reference, |(resource, _)| resource)
+}
+
 fn normalize_url_path(path: &str) -> String {
     let trailing_slash = path.ends_with('/');
     let mut segments = Vec::new();
@@ -415,13 +421,15 @@ impl HtmlCtx for MhtmlCtx {
             return Ok(None);
         }
         let reference = resolve_resource_reference(self.resource_base.as_deref(), src);
-        if let Some(&asset_id) = self.image_assets.get(&reference) {
+        let lookup = resource_lookup_key(&reference);
+        if let Some(&asset_id) = self.image_assets.get(lookup) {
             return Ok(Some(ImageSource::Asset(asset_id)));
         }
         if reference.starts_with("cid:") {
             return Ok(Some(ImageSource::Unavailable));
         }
-        Ok(is_absolute_uri(&reference).then_some(ImageSource::External(reference)))
+        Ok((is_absolute_uri(&reference) || reference.starts_with("//"))
+            .then_some(ImageSource::External(reference)))
     }
 
     fn anchor_id(&self, raw: &str) -> AnchorId {

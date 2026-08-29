@@ -495,3 +495,96 @@ Content-Location: styles/site.css
     );
     assert_eq!(to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap(), "**keep me**\n");
 }
+
+#[test]
+fn empty_html_base_falls_back_to_root_content_location() {
+    let mhtml = mhtml_fixture(
+        r#"MIME-Version: 1.0
+Content-Type: multipart/related; type="text/html"; boundary="b"
+
+--b
+Content-Type: text/html; charset=utf-8
+Content-Location: https://example.test/docs/page.html
+
+<!doctype html><base href=""><p><img alt="pixel" src="images/pixel.png"></p>
+--b
+Content-Type: image/png
+Content-Location: https://example.test/docs/images/pixel.png
+Content-Transfer-Encoding: base64
+
+AAECAw==
+--b--
+"#,
+    );
+    let document = to_document(&mhtml, Some(Format::Mhtml)).unwrap();
+    assert!(
+        matches!(&document.blocks[0], Block::Paragraph(inlines) if matches!(&inlines[0], Inline::Image { source: ImageSource::Asset(AssetId(0)), .. }))
+    );
+}
+
+#[test]
+fn image_fragment_is_ignored_for_embedded_resource_lookup() {
+    let mhtml = mhtml_fixture(
+        r#"MIME-Version: 1.0
+Content-Type: multipart/related; type="text/html"; boundary="b"
+
+--b
+Content-Type: text/html; charset=utf-8
+Content-Location: https://example.test/page.html
+
+<!doctype html><p><img alt="pixel" src="https://example.test/pixel.png#view"></p>
+--b
+Content-Type: image/png
+Content-Location: https://example.test/pixel.png
+Content-Transfer-Encoding: base64
+
+AAECAw==
+--b--
+"#,
+    );
+    let document = to_document(&mhtml, Some(Format::Mhtml)).unwrap();
+    assert!(
+        matches!(&document.blocks[0], Block::Paragraph(inlines) if matches!(&inlines[0], Inline::Image { source: ImageSource::Asset(AssetId(0)), .. }))
+    );
+}
+
+#[test]
+fn stylesheet_fragment_is_ignored_for_embedded_resource_lookup() {
+    let mhtml = mhtml_fixture(
+        r#"MIME-Version: 1.0
+Content-Type: multipart/related; type="text/html"; boundary="b"
+
+--b
+Content-Type: text/html; charset=utf-8
+Content-Location: https://example.test/page.html
+
+<!doctype html><link rel="stylesheet" href="https://example.test/site.css#theme"><p class="strong">keep me</p>
+--b
+Content-Type: text/css; charset=utf-8
+Content-Location: https://example.test/site.css
+
+.strong { font-weight: bold }
+--b--
+"#,
+    );
+    assert_eq!(to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap(), "**keep me**\n");
+}
+
+#[test]
+fn protocol_relative_mhtml_image_without_base_is_external() {
+    let mhtml = mhtml_fixture(
+        r#"MIME-Version: 1.0
+Content-Type: multipart/related; type="text/html"; boundary="b"
+
+--b
+Content-Type: text/html; charset=utf-8
+
+<!doctype html><p><img alt="pixel" src="//cdn.example.test/image.png"></p>
+--b--
+"#,
+    );
+    let document = to_document(&mhtml, Some(Format::Mhtml)).unwrap();
+    assert!(
+        matches!(&document.blocks[0], Block::Paragraph(inlines) if matches!(&inlines[0], Inline::Image { source: ImageSource::External(url), .. } if url == "//cdn.example.test/image.png"))
+    );
+}
