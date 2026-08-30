@@ -1,0 +1,24 @@
+name: verify-mhtml-pr4-current-red
+
+on:
+  push:
+    branches: [audit/mhtml-pr4-red-current149]
+
+permissions:
+  contents: read
+
+jobs:
+  semantic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Nesting and format RED regressions
+        run: cargo test --locked --test mhtml_pr4_red -- --nocapture
+  allocation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Base64 allocation RED regression
+        run: cargo test --locked --test mhtml_base64_alloc_red -- --nocapture
