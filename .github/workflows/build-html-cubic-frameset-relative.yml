@@ -51,10 +51,13 @@ jobs:
           old = '''        Ok((is_absolute_uri(src) || src.starts_with("//"))
               .then(|| ImageSource::External(src.to_owned())))
           '''
-          new = '''        Ok(Some(ImageSource::External(src.to_owned())))
+          if old not in text:
+              old = '''        Ok((is_absolute_uri(src) || src.starts_with("//"))
+            .then(|| ImageSource::External(src.to_owned())))
           '''
           assert old in text
-          text = text.replace(old, new, 1)
+          text = text.replace(old, '''        Ok(Some(ImageSource::External(src.to_owned())))
+          ''', 1)
           path.write_text(text)
 
           tests = Path('tests/html.rs')
