@@ -1,0 +1,131 @@
+name: build-mhtml-pr4-reconciled
+
+on:
+  push:
+    branches: [build/mhtml-pr4-reconciled]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Build clean reconciled candidate
+        run: |
+          set -euo pipefail
+          git fetch origin feature/mhtml-support-pr candidate/html-cubic-frameset-relative review/mhtml-followup-candidate3
+          git checkout --detach origin/feature/mhtml-support-pr
+          test "$(git rev-parse HEAD)" = "32c647468193fbff6e4d21b07ab8395295e79e75"
+
+          git checkout origin/candidate/html-cubic-frameset-relative -- tests/html.rs tests/snapshots/snapshots__html__libreoffice-docx-text.html.snap
+          git checkout origin/review/mhtml-followup-candidate3 -- src/formats/mhtml.rs src/lib.rs tests/format_detection.rs tests/mhtml_nesting.rs
+
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/package/limits.rs')
+          text = path.read_text()
+          needle = 'pub const MAX_XML_DEPTH: usize = 256;\n'
+          assert needle in text
+          assert 'MAX_MIME_DEPTH' not in text
+          text = text.replace(needle, needle + '\n/// Maximum MIME multipart nesting depth.\npub const MAX_MIME_DEPTH: usize = 64;\n', 1)
+          path.write_text(text)
+
+          path = Path('src/formats/html.rs')
+          text = path.read_text()
+          start = text.index('pub(crate) fn parse_text_with_context(\n')
+          end = text.index('pub(crate) fn decode_html(bytes: &[u8]) -> String {\n', start)
+          replacement = '''pub(crate) fn parse_text_with_context(
+              text: &str,
+              ordered_stylesheets: Option<&[String]>,
+              ctx: &dyn HtmlCtx,
+              assets: Vec<Asset>,
+          ) -> Result<Document, ConvertError> {
+              preflight_html_complexity(text)?;
+
+              let parsed = Html::parse_document(text);
+              document_from_parsed_html(&parsed, ordered_stylesheets, ctx, assets)
+          }
+
+          pub(crate) fn document_from_parsed_html(
+              parsed: &Html,
+              ordered_stylesheets: Option<&[String]>,
+              ctx: &dyn HtmlCtx,
+              assets: Vec<Asset>,
+          ) -> Result<Document, ConvertError> {
+              let root = parsed.root_element();
+
+              let mut css = Stylesheet::default();
+              if let Some(stylesheets) = ordered_stylesheets {
+                  for stylesheet in stylesheets {
+                      css.add(stylesheet);
+                  }
+              } else {
+                  for style in root.descendent_elements().filter(|e| e.value().name() == "style") {
+                      css.add(&style.text().collect::<String>());
+                  }
+              }
+
+              let body = match root
+                  .descendent_elements()
+                  .find(|e| e.value().name() == "body")
+              {
+                  Some(body) => body,
+                  None if root
+                      .descendent_elements()
+                      .any(|e| e.value().name() == "frameset") =>
+                  {
+                      return Ok(Document::default());
+                  }
+                  None => {
+                      return Err(ConvertError::malformed("HTML parser produced no body element"));
+                  }
+              };
+
+              let mut node_count = 0usize;
+              let body = adapt_element(body, 1, &mut node_count)?;
+              let blocks = crate::shared::html::to_blocks(&body, &css, ctx)?;
+
+              Ok(Document { assets, blocks, ..Document::default() })
+          }
+
+          '''
+          text = text[:start] + replacement + text[end:]
+          ctx_start = text.index('struct StandaloneCtx;')
+          image_start = text.index('    fn image_source(&self, src: &str) -> Result<Option<ImageSource>, ConvertError> {\n', ctx_start)
+          image_end = text.index('    fn anchor_id(&self, raw: &str) -> AnchorId {\n', image_start)
+          image = '''    fn image_source(&self, src: &str) -> Result<Option<ImageSource>, ConvertError> {
+              let src = src.trim();
+              if src.is_empty() {
+                  return Ok(None);
+              }
+              Ok(Some(ImageSource::External(src.to_owned())))
+          }
+
+          '''
+          text = text[:image_start] + image + text[image_end:]
+          path.write_text(text)
+          PY
+
+          cargo fmt --all
+          cargo test --locked --test format_detection
+          cargo test --locked --test mhtml_nesting
+          cargo test --locked --lib formats::mhtml::tests
+          cargo test --locked --test html frameset_html_converts_without_body_error -- --exact
+          cargo test --locked --test html relative_image_is_preserved_without_fetching -- --exact
+
+          git add -A
+          TREE=$(git write-tree)
+          git config user.name "Marcell Manfrin Barbacena"
+          git config user.email "barbacena@gmail.com"
+          COMMIT=$(printf '%s\n' 'fix: reconcile MHTML resource hardening' | git commit-tree "$TREE" -p ce7948287c8b4a62666f851a5845beabb091ef38)
+          git branch -f candidate/mhtml-pr4-reconciled "$COMMIT"
+          git push --force origin candidate/mhtml-pr4-reconciled
+          echo "functional_sha=$COMMIT"
