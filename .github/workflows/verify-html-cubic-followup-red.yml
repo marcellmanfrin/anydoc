@@ -1,0 +1,17 @@
+name: verify-html-cubic-followup-red
+
+on:
+  push:
+    branches: [audit/html-cubic-frameset-relative-red]
+
+permissions:
+  contents: read
+
+jobs:
+  red:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run RED regressions
+        run: cargo test --locked --test html_cubic_followup
