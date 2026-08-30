@@ -1,0 +1,91 @@
+name: build-html-cubic-frameset-relative
+
+on:
+  push:
+    branches: [build/html-cubic-frameset-relative]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Build clean functional candidate
+        run: |
+          git fetch origin candidate/html-cubic-frameset-relative
+          git checkout -B candidate/html-cubic-frameset-relative origin/candidate/html-cubic-frameset-relative
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/formats/html.rs')
+          text = path.read_text()
+          old = '''    let body = root
+              .descendent_elements()
+              .find(|e| e.value().name() == "body")
+              .ok_or_else(|| ConvertError::malformed("HTML parser produced no body element"))?;
+
+          '''
+          new = '''    let body = match root
+              .descendent_elements()
+              .find(|e| e.value().name() == "body")
+          {
+              Some(body) => body,
+              None if root
+                  .descendent_elements()
+                  .any(|e| e.value().name() == "frameset") =>
+              {
+                  return Ok(Document::default());
+              }
+              None => {
+                  return Err(ConvertError::malformed("HTML parser produced no body element"));
+              }
+          };
+
+          '''
+          assert old in text
+          text = text.replace(old, new, 1)
+          old = '''        Ok((is_absolute_uri(src) || src.starts_with("//"))
+              .then(|| ImageSource::External(src.to_owned())))
+          '''
+          new = '''        Ok(Some(ImageSource::External(src.to_owned())))
+          '''
+          assert old in text
+          text = text.replace(old, new, 1)
+          path.write_text(text)
+
+          tests = Path('tests/html.rs')
+          text = tests.read_text()
+          addition = r'''
+          #[test]
+          fn frameset_html_converts_without_body_error() {
+              let html = br#"<!doctype html><html><head><title>frames</title></head><frameset cols="*"><frame src="page.html"></frameset></html>"#;
+              assert_eq!(to_markdown_bytes(html, Some(Format::Html)).unwrap(), "");
+          }
+
+          #[test]
+          fn relative_image_is_preserved_without_fetching() {
+              let html = br#"<!doctype html><p><img src="images/pixel.png"></p>"#;
+              let document = to_document(html, Some(Format::Html)).unwrap();
+              match &document.blocks[0] {
+                  Block::Paragraph(inlines) => assert!(matches!(
+                      &inlines[0],
+                      Inline::Image { source: ImageSource::External(url), .. }
+                          if url == "images/pixel.png"
+                  )),
+                  other => panic!("expected paragraph, got {other:?}"),
+              }
+          }
+          '''.strip()
+          assert 'fn frameset_html_converts_without_body_error' not in text
+          tests.write_text(text.rstrip() + '\n\n' + addition + '\n')
+          PY
+          cargo fmt --all
+          git add src/formats/html.rs tests/html.rs
+          git config user.name "Marcell Manfrin Barbacena"
+          git config user.email "barbacena@gmail.com"
+          git commit -m "fix: handle framesets and relative HTML images"
+          git push origin HEAD:candidate/html-cubic-frameset-relative
