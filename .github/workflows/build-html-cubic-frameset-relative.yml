@@ -23,13 +23,10 @@ jobs:
 
           path = Path('src/formats/html.rs')
           text = path.read_text()
-          old = '''    let body = root
-              .descendent_elements()
-              .find(|e| e.value().name() == "body")
-              .ok_or_else(|| ConvertError::malformed("HTML parser produced no body element"))?;
 
-          '''
-          new = '''    let body = match root
+          start = text.index('    let body = root\n')
+          end = text.index('    let mut node_count = 0usize;\n', start)
+          text = text[:start] + '''    let body = match root
               .descendent_elements()
               .find(|e| e.value().name() == "body")
           {
@@ -45,19 +42,19 @@ jobs:
               }
           };
 
-          '''
-          assert old in text
-          text = text.replace(old, new, 1)
-          old = '''        Ok((is_absolute_uri(src) || src.starts_with("//"))
-              .then(|| ImageSource::External(src.to_owned())))
-          '''
-          if old not in text:
-              old = '''        Ok((is_absolute_uri(src) || src.starts_with("//"))
-            .then(|| ImageSource::External(src.to_owned())))
-          '''
-          assert old in text
-          text = text.replace(old, '''        Ok(Some(ImageSource::External(src.to_owned())))
-          ''', 1)
+          ''' + text[end:]
+
+          start = text.index('    fn image_source(&self, src: &str) -> Result<Option<ImageSource>, ConvertError> {\n')
+          end = text.index('    fn anchor_id(&self, raw: &str) -> AnchorId {\n', start)
+          text = text[:start] + '''    fn image_source(&self, src: &str) -> Result<Option<ImageSource>, ConvertError> {
+              let src = src.trim();
+              if src.is_empty() {
+                  return Ok(None);
+              }
+              Ok(Some(ImageSource::External(src.to_owned())))
+          }
+
+          ''' + text[end:]
           path.write_text(text)
 
           tests = Path('tests/html.rs')
