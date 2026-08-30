@@ -1,0 +1,17 @@
+name: verify-pr4-nonmultipart-boundary-red
+
+on:
+  push:
+    branches: [audit/pr4-nonmultipart-boundary-red]
+
+permissions:
+  contents: read
+
+jobs:
+  red:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run RED regression
+        run: cargo test --locked --test mhtml_nonmultipart_boundary_red
