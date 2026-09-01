@@ -374,3 +374,71 @@ fn bare_hash_link_is_preserved_as_relative_url() {
     let markdown = to_markdown_bytes(html, Some(Format::Html)).unwrap();
     assert_eq!(markdown, "[top](#)\n");
 }
+
+#[test]
+fn foreign_content_breakout_does_not_bypass_depth_limit() {
+    // <p> breaks out of <svg>; the HTML <path/> tags that follow must not
+    // be honored as foreign self-closing, otherwise the depth accounting
+    // never runs and the DOM is constructed before any limit fires.
+    let mut html = String::from("<!doctype html><body><svg><p>");
+    for _ in 0..300 {
+        html.push_str("<path/>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    match error {
+        ConvertError::ResourceLimit { limit: "max_xml_depth", detail } => {
+            assert!(detail.contains("before DOM construction"), "unexpected detail: {detail}");
+        }
+        other => panic!("expected max_xml_depth, got {other:?}"),
+    }
+}
+
+#[test]
+fn headings_with_open_inlines_are_rejected_before_dom_construction() {
+    // html5ever pops the current node only when it is already a heading, so
+    // unclosed inline elements between headings really do nest in the DOM.
+    // The preflight mirrors the parser and must reject the shape before DOM
+    // construction.
+    let mut html = String::from("<!doctype html><body>");
+    for i in 0..300 {
+        html.push_str(&format!("<h{}><span>t", (i % 6) + 1));
+    }
+    html.push_str("</body>");
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    match error {
+        ConvertError::ResourceLimit { limit: "max_xml_depth", detail } => {
+            assert!(detail.contains("before DOM construction"), "unexpected detail: {detail}");
+        }
+        other => panic!("expected max_xml_depth, got {other:?}"),
+    }
+}
+
+#[test]
+fn optgroup_start_closes_previous_option_and_group() {
+    let mut html = String::from("<!doctype html><body><select>");
+    for _ in 0..300 {
+        html.push_str("<optgroup><option>a");
+    }
+    html.push_str("</select></body>");
+    assert!(to_markdown_bytes(html.as_bytes(), Some(Format::Html)).is_ok());
+}
+
+#[test]
+fn row_group_start_closes_previous_row_group() {
+    let mut html = String::from("<!doctype html><body><table>");
+    for _ in 0..300 {
+        html.push_str("<tbody><tr><td>x");
+    }
+    html.push_str("</table></body>");
+    assert!(to_markdown_bytes(html.as_bytes(), Some(Format::Html)).is_ok());
+}
+
+#[test]
+fn text_directly_under_list_is_preserved() {
+    let html = br##"<!doctype html><ul>stray bullet<li>b item</ul><ol start="2">stray ordered<li>o item</ol>"##;
+    let markdown = to_markdown_bytes(html, Some(Format::Html)).unwrap();
+    assert!(markdown.contains("stray bullet"), "got: {markdown:?}");
+    assert!(markdown.contains("stray ordered"), "got: {markdown:?}");
+    assert!(markdown.contains("b item"), "got: {markdown:?}");
+    assert!(markdown.contains("o item"), "got: {markdown:?}");
+}

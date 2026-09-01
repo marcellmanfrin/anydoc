@@ -316,6 +316,21 @@ impl Builder<'_> {
         Ok(b.finish())
     }
 
+    /// Render a bare text node in a fresh block context. Malformed markup
+    /// can leave visible text directly under `ul`/`ol`; it must not be
+    /// dropped when the children are collected for list parsing.
+    fn text_blocks(&mut self, text: &str, delta: StyleDelta) -> Vec<Block> {
+        let mut b = Builder {
+            blocks: Vec::new(),
+            inlines: Vec::new(),
+            css: self.css,
+            ctx: self.ctx,
+            start_boundary: true,
+        };
+        b.push_text(text, delta);
+        b.finish()
+    }
+
     /// Element-level props: matching stylesheet rules and the inline `style`
     /// attribute merged in one cascade order — normal rules, inline style,
     /// `!important` rules, `!important` inline style.
@@ -558,13 +573,40 @@ impl Builder<'_> {
         delta: StyleDelta,
     ) -> Result<Vec<Block>, ConvertError> {
         let ordered = elem.local == "ol";
-        let children: Vec<&Element> = elem.child_elems().collect();
-        let items: Vec<&Element> = children.iter().copied().filter(|e| e.local == "li").collect();
+        // Text nodes are kept alongside elements: malformed markup can put
+        // visible text directly under the list, and dropping it would lose
+        // content.
+        let children: Vec<&Node> = elem.children.iter().collect();
+        let items: Vec<&Element> = children
+            .iter()
+            .filter_map(|node| match node {
+                Node::Elem(child) if child.local == "li" => Some(child),
+                _ => None,
+            })
+            .collect();
 
         if !ordered {
             let mut out = Vec::new();
             let mut list_items = Vec::new();
             for child in children {
+                let child = match child {
+                    Node::Elem(child) => child,
+                    Node::Text(text) => {
+                        let text_blocks = self.text_blocks(text, delta);
+                        if text_blocks.is_empty() {
+                            continue;
+                        }
+                        if !list_items.is_empty() {
+                            out.push(Block::List(List {
+                                marker: MarkerKind::Bullet,
+                                start: 1,
+                                items: std::mem::take(&mut list_items),
+                            }));
+                        }
+                        out.extend(text_blocks);
+                        continue;
+                    }
+                };
                 if child.local == "li" {
                     list_items.push(ListItem {
                         blocks: self.sub_blocks(child, delta)?,
@@ -629,6 +671,20 @@ impl Builder<'_> {
         let mut item_index = 0usize;
 
         for child in children {
+            let child = match child {
+                Node::Elem(child) => child,
+                Node::Text(text) => {
+                    let text_blocks = self.text_blocks(text, delta);
+                    if text_blocks.is_empty() {
+                        continue;
+                    }
+                    if let Some(list) = current.take() {
+                        out.push(Block::List(list));
+                    }
+                    out.extend(text_blocks);
+                    continue;
+                }
+            };
             if child.local != "li" {
                 let child_blocks = self.sub_element_blocks(child, delta)?;
                 if child_blocks.is_empty() {

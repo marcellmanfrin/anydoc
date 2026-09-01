@@ -170,6 +170,25 @@ impl HtmlComplexitySink {
             open.truncate(position);
         }
     }
+
+    /// Pop through the nearest svg/math ancestor when an HTML breakout tag
+    /// arrives, mirroring html5ever's foreign-content exit. An HTML
+    /// integration point above the foreign root already restores HTML
+    /// semantics, so the stack is left untouched in that case.
+    fn pop_foreign_breakout(&self) {
+        let mut open = self.open_elements.borrow_mut();
+        for (index, candidate) in open.iter().enumerate().rev() {
+            match candidate.as_ref() {
+                "foreignobject" | "desc" | "title" | "mi" | "mo" | "mn" | "ms" | "mtext"
+                | "annotation-xml" => return,
+                "svg" | "math" => {
+                    open.truncate(index);
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 impl TokenSink for HtmlComplexitySink {
@@ -181,6 +200,14 @@ impl TokenSink for HtmlComplexitySink {
                 StartTag => {
                     self.bump_node();
                     let name = tag.name.as_ref();
+                    // html5ever leaves foreign content when an HTML breakout
+                    // tag arrives. Model that before classifying self-closing
+                    // tags, otherwise a stale svg/math entry makes later HTML
+                    // tags look foreign and their self-closing forms skip the
+                    // depth accounting.
+                    if is_foreign_content_html_breakout(name) {
+                        self.pop_foreign_breakout();
+                    }
                     let honor_self_closing = tag.self_closing
                         && html5_self_closing_is_honored(&self.open_elements.borrow(), name);
                     if !is_void_html_element(name) && !honor_self_closing {
@@ -234,10 +261,28 @@ fn close_implied_before_start(open: &mut Vec<LocalName>, name: &str) {
         open.pop();
     }
 
+    // html5ever pops the current node only when it is already a heading
+    // (a heading start tag does not pop intervening elements), so the
+    // preflight mirrors exactly that: pop the innermost element when it is
+    // a heading.
     if is_heading_element(name)
         && open.last().is_some_and(|candidate| is_heading_element(candidate.as_ref()))
     {
         open.pop();
+    }
+
+    // HTML5 select insertion: a new optgroup closes an open option and the
+    // enclosing optgroup.
+    if name == "optgroup" {
+        let target = if open.iter().any(|candidate| candidate.as_ref() == "optgroup") {
+            "optgroup"
+        } else {
+            "option"
+        };
+        if let Some(position) = open.iter().rposition(|candidate| candidate.as_ref() == target) {
+            open.truncate(position);
+            return;
+        }
     }
 
     let implied = match name {
@@ -246,9 +291,9 @@ fn close_implied_before_start(open: &mut Vec<LocalName>, name: &str) {
         "dt" | "dd" => &["dt", "dd"][..],
         "rt" | "rp" => &["rt", "rp"][..],
         "option" => &["option"][..],
-        "optgroup" => &["option", "optgroup"][..],
         "tr" => &["tr"][..],
         "td" | "th" => &["td", "th"][..],
+        "tbody" | "thead" | "tfoot" => &["tbody", "thead", "tfoot"][..],
         _ => return,
     };
     if let Some(position) = open.iter().rposition(|candidate| implied.contains(&candidate.as_ref()))
