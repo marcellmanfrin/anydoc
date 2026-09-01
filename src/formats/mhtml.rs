@@ -139,7 +139,7 @@ fn preflight_base64_decoder_allocations_with_limit(
         enforce_base64_parser_reserve(bytes.len().saturating_sub(body_start), max_entry_bytes)?;
     }
 
-    let Some(boundary) = mime_boundary_from_headers(headers) else {
+    let Some(boundary) = mime_boundary_from_headers(headers)? else {
         return Ok(());
     };
     preflight_multipart_base64(bytes, body_start, bytes.len(), &boundary, max_entry_bytes, 1)
@@ -172,6 +172,12 @@ fn preflight_multipart_base64(
             break;
         };
         let headers = &bytes[headers_start..body_start];
+        if headers.len() > MAX_PART_HEADER_BYTES {
+            return Err(ConvertError::malformed(format!(
+                "MHTML part headers are {} bytes; maximum is {MAX_PART_HEADER_BYTES}",
+                headers.len()
+            )));
+        }
 
         let next_parent =
             find_bytes(&bytes[body_start..end], &marker).map_or(end, |next| body_start + next);
@@ -185,8 +191,15 @@ fn preflight_multipart_base64(
             // mail-parser eagerly decodes part bodies while parsing. Quoted-printable
             // never expands its input, so the encoded region size bounds the decoded
             // allocation; reject oversized parts before the parser materializes a
-            // body the limits would reject afterwards.
-            let encoded_len = next_parent.saturating_sub(body_start);
+            // body the limits would reject afterwards. The region ends at the line
+            // ending that precedes the next boundary delimiter.
+            let mut encoded_end = next_parent;
+            if bytes.get(encoded_end.saturating_sub(2)..encoded_end) == Some(b"\r\n") {
+                encoded_end -= 2;
+            } else if bytes.get(encoded_end.saturating_sub(1)..encoded_end) == Some(b"\n") {
+                encoded_end -= 1;
+            }
+            let encoded_len = encoded_end.saturating_sub(body_start);
             if encoded_len as u64 > max_entry_bytes {
                 return Err(ConvertError::ResourceLimit {
                     limit: "max_entry_bytes",
@@ -197,7 +210,31 @@ fn preflight_multipart_base64(
             }
         }
 
-        if let Some(nested_boundary) = mime_boundary_from_headers(headers) {
+        if headers_are_message(headers) {
+            // An encapsulated message carries its own MIME tree; mail-parser
+            // parses (and base64-reserves) it during the outer parse, so the
+            // preflight must walk it too. Count it against the same depth
+            // budget.
+            let nested_depth = depth.saturating_add(1);
+            if nested_depth > limits::MAX_MIME_DEPTH {
+                return Err(ConvertError::ResourceLimit {
+                    limit: "max_mime_depth",
+                    detail: format!(
+                        "MHTML MIME nesting depth {nested_depth} exceeds maximum of {}",
+                        limits::MAX_MIME_DEPTH
+                    ),
+                });
+            }
+            preflight_encapsulated_message(
+                bytes,
+                body_start,
+                next_parent,
+                max_entry_bytes,
+                nested_depth,
+            )?;
+        }
+
+        if let Some(nested_boundary) = mime_boundary_from_headers(headers)? {
             let nested_depth = depth.saturating_add(1);
             if nested_depth > limits::MAX_MIME_DEPTH {
                 return Err(ConvertError::ResourceLimit {
@@ -220,6 +257,72 @@ fn preflight_multipart_base64(
         offset = next_parent;
     }
 
+    Ok(())
+}
+
+fn headers_are_message(headers: &[u8]) -> bool {
+    let Some(message) = MessageParser::new().with_mime_headers().parse_headers(headers) else {
+        return false;
+    };
+    message
+        .content_type()
+        .is_some_and(|content_type| content_type.ctype().eq_ignore_ascii_case("message"))
+}
+
+/// Walk an encapsulated message body the way the multipart walk does: bound
+/// the base64 reserve, bound quoted-printable parts, and recurse into any
+/// inner multipart tree.
+fn preflight_encapsulated_message(
+    bytes: &[u8],
+    body_start: usize,
+    end: usize,
+    max_entry_bytes: u64,
+    depth: usize,
+) -> Result<(), ConvertError> {
+    let Some((_, inner_body_start)) = mime_header_body_start(bytes, body_start, end) else {
+        return Ok(());
+    };
+    let headers = &bytes[body_start..inner_body_start];
+    if headers.len() > MAX_PART_HEADER_BYTES {
+        return Err(ConvertError::malformed(format!(
+            "MHTML encapsulated message headers are {} bytes; maximum is {MAX_PART_HEADER_BYTES}",
+            headers.len()
+        )));
+    }
+
+    if headers_use_base64(headers) {
+        enforce_base64_parser_reserve(
+            bytes.len().saturating_sub(inner_body_start),
+            max_entry_bytes,
+        )?;
+    } else if headers_use_quoted_printable(headers) {
+        let mut encoded_end = end;
+        if bytes.get(encoded_end.saturating_sub(2)..encoded_end) == Some(b"\r\n") {
+            encoded_end -= 2;
+        } else if bytes.get(encoded_end.saturating_sub(1)..encoded_end) == Some(b"\n") {
+            encoded_end -= 1;
+        }
+        let encoded_len = encoded_end.saturating_sub(inner_body_start);
+        if encoded_len as u64 > max_entry_bytes {
+            return Err(ConvertError::ResourceLimit {
+                limit: "max_entry_bytes",
+                detail: format!(
+                    "MHTML quoted-printable part can decode to at most {encoded_len} bytes; maximum is {max_entry_bytes}"
+                ),
+            });
+        }
+    }
+
+    if let Some(boundary) = mime_boundary_from_headers(headers)? {
+        preflight_multipart_base64(
+            bytes,
+            inner_body_start,
+            end,
+            &boundary,
+            max_entry_bytes,
+            depth,
+        )?;
+    }
     Ok(())
 }
 
@@ -252,16 +355,40 @@ fn mime_header_body_start(bytes: &[u8], start: usize, end: usize) -> Option<(usi
     }
 }
 
-fn mime_boundary_from_headers(headers: &[u8]) -> Option<Vec<u8>> {
-    let message = MessageParser::new().with_mime_headers().parse_headers(headers)?;
-    let content_type = message.content_type()?;
+/// Maximum MIME boundary length accepted by the preflight. RFC 2046 caps
+/// boundaries at 70 characters; the generous headroom still blocks
+/// pathological headers from driving large copies before the marker is
+/// built.
+const MAX_MIME_BOUNDARY_BYTES: usize = 256;
+
+/// Maximum size of a MIME part header block the preflight will parse.
+/// Real headers are far smaller; the cap bounds every allocation driven by
+/// header contents (unfolding, mail-parser parsing, boundary copies).
+const MAX_PART_HEADER_BYTES: usize = 64 * 1024;
+
+fn mime_boundary_from_headers(headers: &[u8]) -> Result<Option<Vec<u8>>, ConvertError> {
+    let Some(message) = MessageParser::new().with_mime_headers().parse_headers(headers) else {
+        return Ok(None);
+    };
+    let Some(content_type) = message.content_type() else {
+        return Ok(None);
+    };
     // mail-parser only nests multipart media types. A `boundary` parameter on
     // any other media type does not create nested MIME parts, so the preflight
     // must not treat boundary-looking body text there as nested MIME.
     if !content_type.ctype().eq_ignore_ascii_case("multipart") {
-        return None;
+        return Ok(None);
     }
-    content_type.attribute("boundary").map(|boundary| boundary.as_bytes().to_vec())
+    let Some(boundary) = content_type.attribute("boundary") else {
+        return Ok(None);
+    };
+    if boundary.len() > MAX_MIME_BOUNDARY_BYTES {
+        return Err(ConvertError::malformed(format!(
+            "MHTML MIME boundary is {} bytes; maximum is {MAX_MIME_BOUNDARY_BYTES}",
+            boundary.len()
+        )));
+    }
+    Ok(Some(boundary.as_bytes().to_vec()))
 }
 
 fn headers_use_base64(headers: &[u8]) -> bool {
@@ -312,6 +439,10 @@ fn transfer_decoded_part_bytes(
         .get(part.offset_body as usize..part.offset_end as usize)
         .ok_or_else(|| ConvertError::malformed(format!("MHTML {label} byte range is invalid")))?;
 
+    if part.is_encoding_problem {
+        return Err(ConvertError::malformed(format!("MHTML {label} transfer encoding is invalid")));
+    }
+
     let decoded = match part.encoding {
         Encoding::None => {
             enforce_part_size(raw.len(), label, "body")?;
@@ -324,6 +455,7 @@ fn transfer_decoded_part_bytes(
             })?
         }
         Encoding::Base64 => {
+            enforce_part_size(raw.len(), label, "base64 encoded body")?;
             let upper_bound = base64_decoded_upper_bound(raw);
             if upper_bound > limits::MAX_ENTRY_BYTES {
                 return Err(ConvertError::ResourceLimit {

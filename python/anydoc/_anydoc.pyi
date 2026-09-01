@@ -50,8 +50,10 @@ class MissingPartError(ConvertError):
 
 def format_from_bytes(data: bytes | bytearray) -> Format | None:
     """Detect the format from the content itself: the signature and identity
-    each container specification designates (PDF header, RTF open group, MIME
-    HTML aggregate, OLE stream names, ZIP package mimetype/content types).
+    each container specification designates (PDF header, RTF open group, an
+    HTML5 doctype or `<html>` marker, a MIME HTML aggregate carrying
+    archive-specific evidence such as Snapshot-Content-Location, OLE stream
+    names, ZIP package mimetype/content types).
     Plain-text formats (CSV) carry no signature and return `None`; so does
     anything unrecognized."""
 
