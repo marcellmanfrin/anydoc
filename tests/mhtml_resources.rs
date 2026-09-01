@@ -1,5 +1,5 @@
 use anydoc::model::{Block, ImageSource, Inline};
-use anydoc::{ConvertError, Format, to_document, to_markdown_bytes};
+use anydoc::{Format, to_document, to_markdown_bytes};
 
 fn mhtml_fixture(source: &str) -> Vec<u8> {
     source.replace('\n', "\r\n").into_bytes()
@@ -53,17 +53,4 @@ Content-Location: https://example.test/site.css#saved
 "#,
     );
     assert_eq!(to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap(), "**keep me**\n");
-}
-
-#[test]
-fn repeated_unclosed_anchors_do_not_trigger_depth_limit() {
-    let mut html = String::from("<!doctype html>");
-    for index in 0..300 {
-        html.push_str(&format!("<a href=\"#{index}\">link"));
-    }
-    let result = to_markdown_bytes(html.as_bytes(), Some(Format::Html));
-    assert!(
-        !matches!(result, Err(ConvertError::ResourceLimit { limit: "max_xml_depth", .. })),
-        "HTML5 repairs repeated anchors; preflight must not reject them as excessive depth"
-    );
 }

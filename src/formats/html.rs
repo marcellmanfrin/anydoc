@@ -48,6 +48,15 @@ pub(crate) fn parse_text_with_context(
     preflight_html_complexity(text)?;
 
     let parsed = Html::parse_document(text);
+    document_from_parsed_html(&parsed, ordered_stylesheets, ctx, assets)
+}
+
+pub(crate) fn document_from_parsed_html(
+    parsed: &Html,
+    ordered_stylesheets: Option<&[String]>,
+    ctx: &dyn HtmlCtx,
+    assets: Vec<Asset>,
+) -> Result<Document, ConvertError> {
     let root = parsed.root_element();
 
     let mut css = Stylesheet::default();
@@ -239,7 +248,7 @@ fn close_implied_before_start(open: &mut Vec<LocalName>, name: &str) {
     if name == "a"
         && let Some(position) = open.iter().rposition(|candidate| candidate.as_ref() == "a")
     {
-        open.truncate(position);
+        open.remove(position);
     }
 
     if is_heading_element(name)
@@ -526,5 +535,22 @@ mod tests {
             sniff_meta_charset(b"<script>const x='<meta charset=windows-1252>';</script>"),
             None
         );
+    }
+    #[test]
+    fn nested_anchor_repair_preserves_structural_depth_in_preflight() {
+        let segment = limits::MAX_XML_DEPTH / 2;
+        let mut html = String::from("<!doctype html><a href=\"#outer\">");
+        for _ in 0..segment {
+            html.push_str("<div>");
+        }
+        html.push_str("<a href=\"#inner\">");
+        for _ in 0..segment {
+            html.push_str("<div>");
+        }
+
+        assert!(matches!(
+            preflight_html_complexity(&html),
+            Err(ConvertError::ResourceLimit { limit: "max_xml_depth", .. })
+        ));
     }
 }
