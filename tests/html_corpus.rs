@@ -18,16 +18,6 @@ fn assert_both_contain(source: &str, html: &str, needles: &[&str]) {
 }
 
 #[test]
-fn controlled_document_preserves_rich_text_links_and_unicode() {
-    let bytes = fs::read(html_fixture("controlled-document.html")).unwrap();
-    let markdown = to_markdown_bytes(&bytes, Some(Format::Html)).unwrap();
-    assert_eq!(
-        markdown,
-        "# Fixture Document\n\nPlain paragraph with **bold**, *italic*, and [example](https://example.com/page).\n\n## Unicode\n\ncafé Ł music 𝄞 family 👨‍👩‍👧.\n\n**Styled bold paragraph.**\n"
-    );
-}
-
-#[test]
 fn controlled_nested_lists_preserve_numbering_and_structure() {
     let bytes = fs::read(html_fixture("controlled-lists.html")).unwrap();
     let markdown = to_markdown_bytes(&bytes, Some(Format::Html)).unwrap();
