@@ -134,6 +134,12 @@ fn preflight_base64_decoder_allocations_with_limit(
         return Ok(());
     };
     let headers = &bytes[..body_start];
+    if headers.len() > MAX_PART_HEADER_BYTES {
+        return Err(ConvertError::malformed(format!(
+            "MHTML root headers are {} bytes; maximum is {MAX_PART_HEADER_BYTES}",
+            headers.len()
+        )));
+    }
 
     if headers_use_base64(headers) {
         enforce_base64_parser_reserve(bytes.len().saturating_sub(body_start), max_entry_bytes)?;
@@ -158,10 +164,9 @@ fn preflight_multipart_base64(
     marker.extend_from_slice(boundary);
 
     while offset < end {
-        let Some(marker_offset) = find_bytes(&bytes[offset..end], &marker) else {
+        let Some(marker_start) = find_marker(bytes, offset, end, &marker, false) else {
             break;
         };
-        let marker_start = offset + marker_offset;
         let marker_end = marker_start + marker.len();
         if bytes.get(marker_end..marker_end + 2) == Some(b"--") {
             break;
@@ -179,8 +184,7 @@ fn preflight_multipart_base64(
             )));
         }
 
-        let next_parent =
-            find_bytes(&bytes[body_start..end], &marker).map_or(end, |next| body_start + next);
+        let next_parent = find_marker(bytes, body_start, end, &marker, true).unwrap_or(end);
 
         if headers_use_base64(headers) {
             // mail-parser 0.11.x reserves from MessageStream::remaining() before it scans
@@ -225,13 +229,62 @@ fn preflight_multipart_base64(
                     ),
                 });
             }
-            preflight_encapsulated_message(
-                bytes,
-                body_start,
-                next_parent,
-                max_entry_bytes,
-                nested_depth,
-            )?;
+            let mut encoded_end = next_parent;
+            if bytes.get(encoded_end.saturating_sub(2)..encoded_end) == Some(b"\r\n") {
+                encoded_end -= 2;
+            } else if bytes.get(encoded_end.saturating_sub(1)..encoded_end) == Some(b"\n") {
+                encoded_end -= 1;
+            }
+            let body_region = &bytes[body_start..encoded_end];
+            if headers_use_base64(headers) {
+                // The encapsulated message is only visible after decoding;
+                // bound the decode and walk the decoded bytes.
+                let upper_bound = base64_decoded_upper_bound(body_region);
+                if upper_bound > max_entry_bytes {
+                    return Err(ConvertError::ResourceLimit {
+                        limit: "max_entry_bytes",
+                        detail: format!(
+                            "MHTML encapsulated message base64 body can decode to at most {upper_bound} bytes; maximum is {max_entry_bytes}"
+                        ),
+                    });
+                }
+                if let Some(decoded) = base64_decode(body_region) {
+                    preflight_encapsulated_message(
+                        &decoded,
+                        0,
+                        decoded.len(),
+                        max_entry_bytes,
+                        nested_depth,
+                    )?;
+                }
+            } else if headers_use_quoted_printable(headers) {
+                if body_region.len() as u64 > max_entry_bytes {
+                    return Err(ConvertError::ResourceLimit {
+                        limit: "max_entry_bytes",
+                        detail: format!(
+                            "MHTML encapsulated message quoted-printable body is {} bytes; maximum is {max_entry_bytes}",
+                            body_region.len()
+                        ),
+                    });
+                }
+                if let Some(decoded) = quoted_printable_decode(body_region) {
+                    preflight_encapsulated_message(
+                        &decoded,
+                        0,
+                        decoded.len(),
+                        max_entry_bytes,
+                        nested_depth,
+                    )?;
+                }
+            } else {
+                preflight_encapsulated_message(
+                    bytes,
+                    body_start,
+                    encoded_end,
+                    max_entry_bytes,
+                    nested_depth,
+                )?;
+            }
         }
 
         if let Some(nested_boundary) = mime_boundary_from_headers(headers)? {
@@ -421,6 +474,40 @@ fn skip_boundary_line(bytes: &[u8], mut offset: usize, end: usize) -> usize {
         }
     }
     offset
+}
+
+/// True when the bytes right after a marker occurrence finish a proper MIME
+/// delimiter: the closing dashes, or the CRLF/LF that ends the boundary line.
+/// Without this, a boundary that is a prefix of another (b1 vs b10) or random
+/// body bytes cross-match.
+fn is_delimiter_end(bytes: &[u8], marker_end: usize) -> bool {
+    matches!(bytes.get(marker_end), Some(b'\r') | Some(b'\n'))
+        || bytes.get(marker_end..marker_end + 2) == Some(b"--")
+}
+
+/// Find the next proper delimiter for the boundary marker in bytes[start..end].
+/// line_start_only additionally requires the RFC 2046 line-start position;
+/// detection keeps mail-parser's lenient position matching (see the
+/// embedded-boundary unit test) while part-region lookup is strict, so
+/// boundary-looking bytes inside a body cannot truncate a region early and
+/// under-bound the size checks.
+fn find_marker(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    marker: &[u8],
+    line_start_only: bool,
+) -> Option<usize> {
+    let mut search = start;
+    while let Some(offset) = find_bytes(&bytes[search..end], marker) {
+        let absolute = search + offset;
+        let anchored = !line_start_only || absolute == 0 || bytes[absolute - 1] == b'\n';
+        if anchored && is_delimiter_end(bytes, absolute + marker.len()) {
+            return Some(absolute);
+        }
+        search = absolute + 1;
+    }
+    None
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -722,7 +809,9 @@ fn split_path_suffix(value: &str) -> (&str, &str) {
 }
 
 fn resource_lookup_key(reference: &str) -> &str {
-    reference.split_once('#').map_or(reference, |(resource, _)| resource)
+    // Strip both query and fragment: archive parts are keyed by the resource
+    // path, and references carrying either component must still resolve.
+    split_path_suffix(reference).0
 }
 
 fn normalize_url_path(path: &str) -> String {
@@ -802,19 +891,116 @@ mod tests {
         let input = b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"real\"\r\n\r\n--real\r\nContent-Type: text/plain\r\n\r\nbody --not-real Content-Transfer-Encoding: base64\r\n\r\n0123456789abcdef\r\n--real--\r\n";
         assert!(preflight_base64_decoder_allocations_with_limit(input, 8).is_ok());
     }
-}
 
-#[test]
-fn quoted_printable_part_is_bounded_before_mime_parse() {
-    let input = b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/html\r\n\r\n<p>ok</p>\r\n--b\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n0123456789abcdef\r\n--b--\r\n";
-    assert!(matches!(
-        preflight_base64_decoder_allocations_with_limit(input, 8),
-        Err(ConvertError::ResourceLimit { limit: "max_entry_bytes", .. })
-    ));
-}
+    #[test]
+    fn quoted_printable_part_is_bounded_before_mime_parse() {
+        let input = b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/html\r\n\r\n<p>ok</p>\r\n--b\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n0123456789abcdef\r\n--b--\r\n";
+        assert!(matches!(
+            preflight_base64_decoder_allocations_with_limit(input, 8),
+            Err(ConvertError::ResourceLimit { limit: "max_entry_bytes", .. })
+        ));
+    }
 
-#[test]
-fn quoted_printable_part_within_limit_passes_preflight() {
-    let input = b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/html\r\n\r\n<p>ok</p>\r\n--b\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n0123456789abcdef\r\n--b--\r\n";
-    assert!(preflight_base64_decoder_allocations_with_limit(input, 64).is_ok());
+    #[test]
+    fn quoted_printable_part_within_limit_passes_preflight() {
+        let input = b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/html\r\n\r\n<p>ok</p>\r\n--b\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n0123456789abcdef\r\n--b--\r\n";
+        assert!(preflight_base64_decoder_allocations_with_limit(input, 64).is_ok());
+    }
+    fn nested_multipart_chain(levels: usize) -> Vec<u8> {
+        let mut out = Vec::from(
+            b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"b0\"\r\n\r\n"
+                .as_slice(),
+        );
+        for level in 0..levels {
+            out.extend_from_slice(
+                format!(
+                    "--b{level}\r\nContent-Type: multipart/mixed; boundary=\"b{}\"\r\n\r\n",
+                    level + 1
+                )
+                .as_bytes(),
+            );
+        }
+        out.extend_from_slice(
+            format!(
+                "--b{levels}\r\nContent-Type: text/html\r\n\r\n<p>leaf</p>\r\n--b{levels}--\r\n"
+            )
+            .as_bytes(),
+        );
+        for level in (0..levels).rev() {
+            out.extend_from_slice(format!("--b{level}--\r\n").as_bytes());
+        }
+        out
+    }
+
+    fn base64_for_test(data: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in data.chunks(3) {
+            let b0 = u32::from(chunk[0]);
+            let b1 = u32::from(*chunk.get(1).unwrap_or(&0));
+            let b2 = u32::from(*chunk.get(2).unwrap_or(&0));
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(TABLE[((n >> 18) & 63) as usize] as char);
+            out.push(TABLE[((n >> 12) & 63) as usize] as char);
+            if chunk.len() > 1 {
+                out.push(TABLE[((n >> 6) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+            if chunk.len() > 2 {
+                out.push(TABLE[(n & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn oversized_root_header_block_is_rejected() {
+        let mut input = Vec::from(
+            "MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"b\"\r\nX-Pad: "
+                .as_bytes(),
+        );
+        input.extend(std::iter::repeat_n(b'a', 70_000));
+        input.extend_from_slice(
+            b"\r\n\r\n--b\r\nContent-Type: text/html\r\n\r\n<p>ok</p>\r\n--b--\r\n",
+        );
+        assert!(matches!(
+            preflight_base64_decoder_allocations(&input),
+            Err(ConvertError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn base64_encapsulated_message_is_walked_after_decode() {
+        // A 70-level multipart chain (beyond MAX_MIME_DEPTH) hidden inside a
+        // base64-encoded message/rfc822 part: the preflight must decode it
+        // (within limits) and walk the inner tree, not scan the base64 text as
+        // if it were MIME headers.
+        let chain = nested_multipart_chain(70);
+        let encoded = base64_for_test(&chain);
+        let mut input = Vec::from(
+            "MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: message/rfc822\r\nContent-Transfer-Encoding: base64\r\n\r\n".as_bytes(),
+        );
+        input.extend_from_slice(encoded.as_bytes());
+        input.extend_from_slice(b"\r\n--b--\r\n");
+        assert!(matches!(
+            preflight_base64_decoder_allocations(&input),
+            Err(ConvertError::ResourceLimit { limit: "max_mime_depth", .. })
+        ));
+    }
+
+    #[test]
+    fn embedded_boundary_bytes_do_not_truncate_quoted_printable_regions() {
+        let input = b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/html\r\n\r\n<p>ok</p>\r\n--b\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nAAAA--bBBBBBBBBBBBBBBBBBBBB\r\n--b--\r\n";
+        // The region ends at the real line-start boundary (27 encoded bytes),
+        // not at the embedded mid-line --b (4 bytes), so 16 rejects and 64 passes.
+        assert!(matches!(
+            preflight_base64_decoder_allocations_with_limit(input, 16),
+            Err(ConvertError::ResourceLimit { limit: "max_entry_bytes", .. })
+        ));
+        assert!(preflight_base64_decoder_allocations_with_limit(input, 64).is_ok());
+    }
 }

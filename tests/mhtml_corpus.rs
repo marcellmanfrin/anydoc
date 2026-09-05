@@ -69,8 +69,12 @@ fn libreoffice_relative_images_deliberately_resolve_via_mhtml_content_location()
 }
 #[test]
 fn realistic_related_css_and_image_resources_resolve() {
-    let h=fs::read_to_string(fixture("controlled-document.html")).unwrap().replace("<style>\n    .strong { font-weight: bold; }\n    .hidden { display: none; }\n  </style>","<base href=\"https://cdn.example.test/assets/\"><link rel=\"stylesheet\" href=\"styles/site.css\">").replace("</body>","<p><img alt=\"pixel\" src=\"images/pixel.png\"></p></body>");
+    let h=fs::read_to_string(fixture("controlled-document.html")).unwrap().replace("  <style>\n    .strong { font-weight: bold; }\n    .hidden { display: none; }\n  </style>","<base href=\"https://cdn.example.test/assets/\"><link rel=\"stylesheet\" href=\"styles/site.css\">").replace("</body>","<p><img alt=\"pixel\" src=\"images/pixel.png\"></p></body>");
     let m=format!("From: <Saved by Blink>\r\nSnapshot-Content-Location: https://example.test/docs/page.html\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; type=\"text/html\"; start=\"<root@id>\"; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/html; charset=utf-8\r\nContent-ID: <root@id>\r\nContent-Location: https://example.test/docs/page.html\r\n\r\n{h}\r\n--b\r\nContent-Type: text/css; charset=utf-8\r\nContent-Location: https://cdn.example.test/assets/styles/site.css\r\n\r\n.strong {{ font-weight: bold; }} .hidden {{ display: none; }}\r\n--b\r\nContent-Type: image/png\r\nContent-ID: <IMAGE@ID>\r\nContent-Location: https://cdn.example.test/assets/images/pixel.png\r\nContent-Transfer-Encoding: base64\r\n\r\nAAECAw==\r\n--b--\r\n").into_bytes();
+    assert!(
+        h.contains("styles/site.css") && !h.contains("<style>"),
+        "fixture style block replacement must apply, otherwise the linked-CSS part is never referenced"
+    );
     let d = to_document(&m, Some(Format::Mhtml)).unwrap();
     assert_eq!(d.assets.len(), 1);
     assert!(d.blocks.iter().any(|b|matches!(b,Block::Paragraph(xs)if xs.iter().any(|x|matches!(x,Inline::Image{source:ImageSource::Asset(_),..})))));

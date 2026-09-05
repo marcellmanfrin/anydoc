@@ -707,3 +707,31 @@ PNGDATA
         other => panic!("expected paragraph, got {other:?}"),
     }
 }
+
+#[test]
+fn query_string_is_ignored_for_embedded_resource_lookup() {
+    let mhtml = mhtml_fixture(
+        r#"MIME-Version: 1.0
+Content-Type: multipart/related; boundary="b"
+
+--b
+Content-Type: text/html; charset=utf-8
+
+<!doctype html><p><img alt="pixel" src="img.png?v=2"></p>
+--b
+Content-Type: image/png
+Content-Location: img.png
+
+PNGDATA
+--b--
+"#,
+    );
+    let document = to_document(&mhtml, Some(Format::Mhtml)).unwrap();
+    assert_eq!(document.assets.len(), 1);
+    match &document.blocks[0] {
+        Block::Paragraph(inlines) => {
+            assert!(matches!(&inlines[0], Inline::Image { source: ImageSource::Asset(_), .. }))
+        }
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
