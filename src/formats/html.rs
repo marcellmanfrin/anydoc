@@ -193,7 +193,9 @@ impl HtmlComplexitySink {
     fn close_implied(&self, name: &str) {
         let mut open = self.open_elements.borrow_mut();
         if !in_foreign_content(&open) {
-            close_implied_before_start(&mut open, name);
+            // Void tags are never pushed, so the ignore-token result only
+            // matters for callers that would push (push_element).
+            let _ignore = close_implied_before_start(&mut open, name);
         }
     }
 
@@ -213,8 +215,12 @@ impl HtmlComplexitySink {
         // HTML implied-end-tag rules only apply in HTML content; inside
         // foreign content names like option/tr are ordinary elements and
         // closing them here would undercount real nesting.
-        if !in_foreign_content(&open) {
-            close_implied_before_start(&mut open, name.as_ref());
+        if !in_foreign_content(&open) && close_implied_before_start(&mut open, name.as_ref()) {
+            // html5ever ignores table-family start tags outside a table in
+            // body context; pushing them would grow the modeled stack where
+            // the parser does not, and a later implied close would truncate
+            // the real nesting opened between the stray cells.
+            return;
         }
         open.push(name.clone());
         // Count depth the way the post-parse walk will: adapt_element treats
@@ -234,21 +240,37 @@ impl HtmlComplexitySink {
     }
 
     fn close_element(&self, name: &LocalName) {
-        // html5ever never pops body/html on their end tags: it only switches
-        // insertion modes (after body / after after body) and later start
-        // tags keep nesting in the existing tree. Truncating here would drop
-        // real open nesting and undercount depth.
-        if matches!(name.as_ref(), "body" | "html") {
+        let mut open = self.open_elements.borrow_mut();
+        let name = name.as_ref();
+        let foreign = in_foreign_content(&open);
+        // html5ever never pops body/html on their end tags in HTML content:
+        // it only switches insertion modes (after body / after after body)
+        // and later start tags keep nesting in the existing tree.
+        // Truncating there would drop real open nesting and undercount
+        // depth. Inside foreign content, html/body are ordinary foreign
+        // elements whose matching end tags really do pop them.
+        if matches!(name, "body" | "html") && !foreign {
             return;
         }
-        let mut open = self.open_elements.borrow_mut();
+        // html5ever checks only the current node for option/optgroup end
+        // tags; searching deeper would truncate real nesting the parser
+        // keeps open. In foreign content they are ordinary foreign elements,
+        // so the generic walk below applies instead.
+        if matches!(name, "option" | "optgroup") && !foreign {
+            if name == "optgroup" && open.last().is_some_and(|top| top.as_ref() == "option") {
+                open.pop();
+            }
+            if open.last().is_some_and(|top| top.as_ref() == name) {
+                open.pop();
+            }
+            return;
+        }
         // html5ever ignores an end tag whose element is not in scope; the
         // scope search stops at markers that depend on the end tag (table
         // scope for the table family, list-item scope for li, button scope
-        // for p) and at svg/math foreign roots for every HTML end tag.
-        // Truncating on an out-of-scope match would pop real nesting and
-        // undercount depth.
-        let name = name.as_ref();
+        // for p/dd/dt, ruby scope for rt/rp) and at svg/math foreign roots
+        // for every HTML end tag. Truncating on an out-of-scope match would
+        // pop real nesting and undercount depth.
         for (position, candidate) in open.iter().enumerate().rev() {
             if candidate.as_ref() == name {
                 open.truncate(position);
@@ -351,27 +373,203 @@ impl TokenSink for HtmlComplexitySink {
     }
 }
 
+/// html5ever's generic scope markers: the elements that stop a scope search
+/// for end tags resolved through the generic scope. Per-tag scopes add their
+/// own markers (see is_end_tag_scope_marker).
+const GENERIC_SCOPE_MARKERS: &[&str] =
+    &["applet", "caption", "html", "table", "td", "th", "marquee", "object", "template"];
+
 /// Scope markers that stop the search for an end tag's target element,
-/// mirroring html5ever's scope rules. Foreign roots (svg, math) end every
-/// HTML scope search; HTML integration points (desc, title, foreignObject,
-/// annotation-xml, mi/mo/mn/ms/mtext) deliberately do not.
+/// mirroring html5ever's end-tag rules.
+///
+/// Bare svg/math roots stop every search. That is deliberate even though
+/// html5ever's in-body scope checks list the HTML/MathML integration points
+/// (foreignObject, desc, title, annotation-xml, mi/mo/mn/ms/mtext) rather
+/// than the roots: when a bare root is reachable by the search, the parser
+/// is in the foreign-content phase, whose end-tag walk stops at the first
+/// HTML element or integration point below the root and ignores the token
+/// there. Stopping at the root models the same outcome (ignore). Integration
+/// points always sit below their svg/math root, so a search that passed one
+/// would reach the root stop anyway; dropping the root stop instead would
+/// let scope-based end tags truncate through an open foreign root that the
+/// parser ignores, undercounting real nesting.
 fn is_end_tag_scope_marker(end_tag: &str, candidate: &str) -> bool {
     if matches!(candidate, "svg" | "math") {
         return true;
     }
-    const GENERIC: &[&str] =
-        &["applet", "caption", "html", "table", "td", "th", "marquee", "object", "template"];
     match end_tag {
         "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption" | "colgroup" => {
             matches!(candidate, "html" | "table" | "template")
         }
-        "li" => GENERIC.contains(&candidate) || matches!(candidate, "ol" | "ul"),
-        "p" => GENERIC.contains(&candidate) || candidate == "button",
-        _ => GENERIC.contains(&candidate),
+        "li" => GENERIC_SCOPE_MARKERS.contains(&candidate) || matches!(candidate, "ol" | "ul"),
+        "p" | "dd" | "dt" => GENERIC_SCOPE_MARKERS.contains(&candidate) || candidate == "button",
+        "rt" | "rp" | "rb" | "rtc" => {
+            GENERIC_SCOPE_MARKERS.contains(&candidate) || matches!(candidate, "ruby" | "rtc")
+        }
+        // The div family (plus button, form, the headings, and template)
+        // pops to its match when the match is in generic scope.
+        _ if is_generic_scope_end_tag(end_tag) => GENERIC_SCOPE_MARKERS.contains(&candidate),
+        // Any other end tag: html5ever's walk ignores the token the moment
+        // it reaches any special element whose name does not match.
+        // Stopping only at the generic scope markers would let a deeper
+        // match pop real nesting (for example </em> below <em><div><span>)
+        // and undercount depth.
+        _ => is_special_element(candidate),
     }
 }
 
-fn close_implied_before_start(open: &mut Vec<LocalName>, name: &str) {
+/// End tags whose html5ever rule is "pop to the matching element when it is
+/// in generic scope, otherwise ignore": the div family plus button, form,
+/// the headings, and template.
+fn is_generic_scope_end_tag(end_tag: &str) -> bool {
+    matches!(
+        end_tag,
+        "address"
+            | "article"
+            | "aside"
+            | "blockquote"
+            | "button"
+            | "center"
+            | "details"
+            | "dialog"
+            | "dir"
+            | "div"
+            | "dl"
+            | "fieldset"
+            | "figcaption"
+            | "figure"
+            | "footer"
+            | "form"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "header"
+            | "hgroup"
+            | "listing"
+            | "main"
+            | "menu"
+            | "nav"
+            | "ol"
+            | "pre"
+            | "section"
+            | "summary"
+            | "template"
+            | "ul"
+    )
+}
+
+/// html5ever's special element category (including the MathML text
+/// integration points and the SVG HTML integration points): the names that
+/// stop the any-other-end-tag walk and the list-item implied-close walk.
+fn is_special_element(candidate: &str) -> bool {
+    matches!(
+        candidate,
+        "address"
+            | "annotation-xml"
+            | "applet"
+            | "area"
+            | "article"
+            | "aside"
+            | "base"
+            | "basefont"
+            | "bgsound"
+            | "blockquote"
+            | "body"
+            | "br"
+            | "button"
+            | "caption"
+            | "center"
+            | "col"
+            | "colgroup"
+            | "dd"
+            | "desc"
+            | "details"
+            | "dir"
+            | "div"
+            | "dl"
+            | "dt"
+            | "embed"
+            | "fieldset"
+            | "figcaption"
+            | "figure"
+            | "foreignobject"
+            | "footer"
+            | "form"
+            | "frame"
+            | "frameset"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "head"
+            | "header"
+            | "hgroup"
+            | "hr"
+            | "html"
+            | "iframe"
+            | "img"
+            | "input"
+            | "keygen"
+            | "li"
+            | "link"
+            | "listing"
+            | "main"
+            | "marquee"
+            | "menu"
+            | "meta"
+            | "mi"
+            | "mn"
+            | "mo"
+            | "ms"
+            | "mtext"
+            | "nav"
+            | "noembed"
+            | "noframes"
+            | "noscript"
+            | "object"
+            | "ol"
+            | "p"
+            | "param"
+            | "plaintext"
+            | "pre"
+            | "script"
+            | "search"
+            | "section"
+            | "select"
+            | "source"
+            | "style"
+            | "summary"
+            | "table"
+            | "tbody"
+            | "td"
+            | "template"
+            | "textarea"
+            | "tfoot"
+            | "th"
+            | "thead"
+            | "title"
+            | "tr"
+            | "track"
+            | "ul"
+            | "wbr"
+            | "xmp"
+    )
+}
+
+/// Apply html5ever's implied-end-tag rules for a start tag to the modeled
+/// stack. Returns true when html5ever would ignore the token outright
+/// (table-family start tags outside a table in body context), in which case
+/// the caller must not push the element either.
+///
+/// Every rule closes only what html5ever would really close: a search that
+/// reaches past a scope boundary would truncate real nesting and undercount
+/// depth, so each walk stops at the markers of its own rule.
+fn close_implied_before_start(open: &mut Vec<LocalName>, name: &str) -> bool {
     if name == "a"
         && let Some(position) = open.iter().rposition(|candidate| candidate.as_ref() == "a")
     {
@@ -399,35 +597,95 @@ fn close_implied_before_start(open: &mut Vec<LocalName>, name: &str) {
         open.pop();
     }
 
-    // HTML5 select insertion: a new optgroup closes an open option and the
-    // enclosing optgroup.
-    if name == "optgroup" {
-        let target = if open.iter().any(|candidate| candidate.as_ref() == "optgroup") {
-            "optgroup"
-        } else {
-            "option"
+    // option/optgroup: html5ever only pops the innermost open element here.
+    // Inside a select, an optgroup start additionally closes an optgroup
+    // that is the current node; in plain body context it does not, and a
+    // deeper search would truncate real nesting opened between the pairs.
+    if matches!(name, "option" | "optgroup") {
+        if open.last().is_some_and(|candidate| candidate.as_ref() == "option") {
+            open.pop();
+        }
+        if name == "optgroup"
+            && open.iter().any(|candidate| candidate.as_ref() == "select")
+            && open.last().is_some_and(|candidate| candidate.as_ref() == "optgroup")
+        {
+            open.pop();
+        }
+        return false;
+    }
+
+    // rt/rp: html5ever pops the current node only when it is an rt/rp.
+    if matches!(name, "rt" | "rp") {
+        if open.last().is_some_and(|candidate| matches!(candidate.as_ref(), "rt" | "rp")) {
+            open.pop();
+        }
+        return false;
+    }
+
+    // Table-family start tags outside a table are ignored outright by
+    // html5ever in body context. Pushing them would let a later implied
+    // close truncate the real nesting opened between stray cells,
+    // undercounting depth; ignoring matches the parser exactly.
+    if matches!(
+        name,
+        "caption" | "col" | "colgroup" | "tbody" | "td" | "tfoot" | "th" | "thead" | "tr"
+    ) {
+        if !open.iter().any(|candidate| candidate.as_ref() == "table") {
+            return true;
+        }
+        // Inside a table, html5ever clears the stack back to the matching
+        // row or body context, popping everything above the target;
+        // truncating at the innermost match models exactly that.
+        let implied: &[&str] = match name {
+            "tr" => &["tr"],
+            "td" | "th" => &["td", "th"],
+            "tbody" | "thead" | "tfoot" => &["tbody", "thead", "tfoot"],
+            _ => &[],
         };
-        if let Some(position) = open.iter().rposition(|candidate| candidate.as_ref() == target) {
+        if let Some(position) =
+            open.iter().rposition(|candidate| implied.contains(&candidate.as_ref()))
+        {
             open.truncate(position);
-            return;
+        }
+        return false;
+    }
+
+    // li / dd / dt: html5ever walks from the innermost element and closes
+    // the matching target only when no special element other than
+    // address/div/p intervenes. An unscoped search would close a target
+    // below, for example, an intervening table or list and undercount the
+    // nesting the parser keeps open.
+    if matches!(name, "li" | "dd" | "dt") {
+        let targets: &[&str] = if name == "li" { &["li"] } else { &["dd", "dt"] };
+        for (position, candidate) in open.iter().enumerate().rev() {
+            let candidate = candidate.as_ref();
+            if targets.contains(&candidate) {
+                open.truncate(position);
+                break;
+            }
+            if is_special_element(candidate) && !matches!(candidate, "address" | "div" | "p") {
+                break;
+            }
+        }
+        return false;
+    }
+
+    // p: html5ever closes an open p only when it is in button scope, so the
+    // search stops at button and the generic scope markers.
+    if name == "p" {
+        for (position, candidate) in open.iter().enumerate().rev() {
+            let candidate = candidate.as_ref();
+            if candidate == "p" {
+                open.truncate(position);
+                break;
+            }
+            if candidate == "button" || GENERIC_SCOPE_MARKERS.contains(&candidate) {
+                break;
+            }
         }
     }
 
-    let implied = match name {
-        "li" => &["li"][..],
-        "p" => &["p"][..],
-        "dt" | "dd" => &["dt", "dd"][..],
-        "rt" | "rp" => &["rt", "rp"][..],
-        "option" => &["option"][..],
-        "tr" => &["tr"][..],
-        "td" | "th" => &["td", "th"][..],
-        "tbody" | "thead" | "tfoot" => &["tbody", "thead", "tfoot"][..],
-        _ => return,
-    };
-    if let Some(position) = open.iter().rposition(|candidate| implied.contains(&candidate.as_ref()))
-    {
-        open.truncate(position);
-    }
+    false
 }
 
 fn is_heading_element(name: &str) -> bool {
