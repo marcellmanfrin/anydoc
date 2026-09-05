@@ -442,3 +442,31 @@ fn text_directly_under_list_is_preserved() {
     assert!(markdown.contains("b item"), "got: {markdown:?}");
     assert!(markdown.contains("o item"), "got: {markdown:?}");
 }
+
+#[test]
+fn foreign_content_title_does_not_swallow_nested_markup() {
+    // html5ever parses an svg <title>'s children as markup (svg title is an
+    // HTML integration point), so the preflight must count them and reject
+    // pathological nesting before DOM construction instead of switching to
+    // the HTML RCDATA state.
+    let mut html = String::from("<!doctype html><body><svg><title>");
+    for _ in 0..300 {
+        html.push_str("<div>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    match error {
+        ConvertError::ResourceLimit { limit: "max_xml_depth", detail } => {
+            assert!(detail.contains("before DOM construction"), "unexpected detail: {detail}");
+        }
+        other => panic!("expected max_xml_depth, got {other:?}"),
+    }
+}
+
+#[test]
+fn html_title_still_swallows_markup_as_raw_text() {
+    // The HTML (non-foreign) <title> keeps RCDATA semantics: nested markup is
+    // text, not elements, and the document converts normally.
+    let html = br#"<!doctype html><html><head><title><div>not markup</div></title></head><body><p>ok</p></body></html>"#;
+    let markdown = to_markdown_bytes(html, Some(Format::Html)).unwrap();
+    assert!(markdown.contains("ok"), "got: {markdown:?}");
+}

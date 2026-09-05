@@ -245,16 +245,22 @@ impl TokenSink for HtmlComplexitySink {
                     }
                     let honor_self_closing = tag.self_closing
                         && html5_self_closing_is_honored(&self.open_elements.borrow(), name);
+                    // Raw-text tokenizer states are an HTML-content decision:
+                    // it must be taken before the new element is pushed, and
+                    // it does not apply inside foreign content, where these
+                    // names are ordinary elements whose children stay markup.
+                    // SVG script is the one exception that still switches.
+                    let foreign = in_foreign_content(&self.open_elements.borrow());
                     if !is_void_html_element(name) && !honor_self_closing {
                         self.push_element(&tag.name);
                     }
                     match name {
-                        "title" | "textarea" => TokenSinkResult::RawData(Rcdata),
-                        "style" | "xmp" | "iframe" | "noembed" | "noframes" => {
+                        "title" | "textarea" if !foreign => TokenSinkResult::RawData(Rcdata),
+                        "style" | "xmp" | "iframe" | "noembed" | "noframes" if !foreign => {
                             TokenSinkResult::RawData(Rawtext)
                         }
                         "script" => TokenSinkResult::RawData(ScriptData),
-                        "plaintext" => TokenSinkResult::Plaintext,
+                        "plaintext" if !foreign => TokenSinkResult::Plaintext,
                         _ => TokenSinkResult::Continue,
                     }
                 }
@@ -387,25 +393,26 @@ fn is_paragraph_closing_element(name: &str) -> bool {
     )
 }
 
+/// True when the innermost relevant ancestor puts the parser in foreign
+/// content: an svg/math root with no HTML integration point above it.
+fn in_foreign_content(open: &[LocalName]) -> bool {
+    for candidate in open.iter().rev() {
+        match candidate.as_ref() {
+            "foreignobject" | "desc" | "title" | "mi" | "mo" | "mn" | "ms" | "mtext"
+            | "annotation-xml" => return false,
+            "svg" | "math" => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 fn html5_self_closing_is_honored(open: &[LocalName], name: &str) -> bool {
     if matches!(name, "svg" | "math") {
         return true;
     }
 
-    let mut in_foreign_content = false;
-    for candidate in open.iter().rev() {
-        match candidate.as_ref() {
-            "foreignobject" | "desc" | "title" | "mi" | "mo" | "mn" | "ms" | "mtext"
-            | "annotation-xml" => return false,
-            "svg" | "math" => {
-                in_foreign_content = true;
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    in_foreign_content && !is_foreign_content_html_breakout(name)
+    in_foreign_content(open) && !is_foreign_content_html_breakout(name)
 }
 
 fn is_foreign_content_html_breakout(name: &str) -> bool {
