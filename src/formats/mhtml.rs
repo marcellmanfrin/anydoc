@@ -481,8 +481,15 @@ fn skip_boundary_line(bytes: &[u8], mut offset: usize, end: usize) -> usize {
 /// Without this, a boundary that is a prefix of another (b1 vs b10) or random
 /// body bytes cross-match.
 fn is_delimiter_end(bytes: &[u8], marker_end: usize) -> bool {
-    matches!(bytes.get(marker_end), Some(b'\r') | Some(b'\n'))
-        || bytes.get(marker_end..marker_end + 2) == Some(b"--")
+    // RFC 2046 allows transport padding (spaces/tabs) between the boundary
+    // and the line ending, and skip_boundary_line accepts the same padding,
+    // so delimiter matching must accept it too.
+    let mut index = marker_end;
+    while matches!(bytes.get(index), Some(b' ') | Some(b'\t')) {
+        index += 1;
+    }
+    matches!(bytes.get(index), Some(b'\r') | Some(b'\n'))
+        || bytes.get(index..index + 2) == Some(b"--")
 }
 
 /// Find the next proper delimiter for the boundary marker in bytes[start..end].
@@ -990,6 +997,18 @@ mod tests {
             preflight_base64_decoder_allocations(&input),
             Err(ConvertError::ResourceLimit { limit: "max_mime_depth", .. })
         ));
+    }
+
+    #[test]
+    fn boundary_with_transport_padding_is_still_a_delimiter() {
+        // RFC 2046 allows LWSP between the boundary and the CRLF; the padded
+        // part must still be found so its QP body stays bounded.
+        let input = b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"b\"\r\n\r\n--b  \r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n0123456789abcdefghijklmnop\r\n--b--\r\n";
+        assert!(matches!(
+            preflight_base64_decoder_allocations_with_limit(input, 8),
+            Err(ConvertError::ResourceLimit { limit: "max_entry_bytes", .. })
+        ));
+        assert!(preflight_base64_decoder_allocations_with_limit(input, 64).is_ok());
     }
 
     #[test]
