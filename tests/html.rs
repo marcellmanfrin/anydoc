@@ -664,3 +664,111 @@ fn li_end_tag_ignores_buttons_and_closes_the_item() {
     }
     assert!(to_markdown_bytes(html.as_bytes(), Some(Format::Html)).is_ok());
 }
+
+#[test]
+fn any_other_end_tag_is_ignored_below_special_elements() {
+    // html5ever's any-other-end-tag walk ignores </em> the moment it
+    // reaches the special div, so the em/div pairs really keep nesting;
+    // truncating at the deeper em match would keep the modeled stack flat
+    // and bypass the depth guard.
+    let mut html = String::from("<!doctype html><body>");
+    for _ in 0..130 {
+        html.push_str("<em><div></em>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    assert_preflight_depth_limit(error);
+}
+
+#[test]
+fn li_start_does_not_close_items_below_special_elements() {
+    // html5ever's li insertion walk stops at any special element other than
+    // address/div/p, so each ul opens a new nesting level and the inner li
+    // stays open; an unscoped search would flatten the stack and bypass the
+    // depth guard on deeply nested lists.
+    let mut html = String::from("<!doctype html><body>");
+    for _ in 0..130 {
+        html.push_str("<ul><li>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    assert_preflight_depth_limit(error);
+}
+
+#[test]
+fn stray_table_cells_outside_a_table_do_not_flatten_nesting() {
+    // html5ever ignores td tokens in body context (no open table), so the
+    // divs opened between them really keep nesting; the preflight must not
+    // push stray cells either, because a later implied close would truncate
+    // the divs and undercount depth.
+    let mut html = String::from("<!doctype html><body>");
+    for _ in 0..300 {
+        html.push_str("<div><td>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    assert_preflight_depth_limit(error);
+}
+
+#[test]
+fn option_end_tags_only_pop_the_current_node() {
+    // html5ever pops an option end tag only when the option is the current
+    // node; below a span the token is ignored and the pairs keep nesting.
+    let mut html = String::from("<!doctype html><body>");
+    for _ in 0..300 {
+        html.push_str("<option><span></option>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    assert_preflight_depth_limit(error);
+}
+
+#[test]
+fn p_start_does_not_close_paragraphs_below_a_button() {
+    // html5ever closes an open p from a p start tag only when the p is in
+    // button scope; below a button it stays open and the pairs nest.
+    let mut html = String::from("<!doctype html><body>");
+    for _ in 0..130 {
+        html.push_str("<p><button>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    assert_preflight_depth_limit(error);
+}
+
+#[test]
+fn dd_end_tag_respects_button_scope() {
+    // </dd> uses button scope like </p>: with a button above the dd the
+    // token is ignored and the divs keep nesting on both sides.
+    let mut html = String::from("<!doctype html><body><dl><dd><button>");
+    for _ in 0..150 {
+        html.push_str("<div>");
+    }
+    html.push_str("</dd>");
+    for _ in 0..150 {
+        html.push_str("<div>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    assert_preflight_depth_limit(error);
+}
+
+#[test]
+fn div_end_tag_still_closes_open_paragraphs() {
+    // The div family pops to its match through non-marker elements (the
+    // any-other-end-tag special stop must not apply to it), so repeated
+    // <div><p></div> blocks stay shallow and the document converts.
+    let mut html = String::from("<!doctype html><body>");
+    for _ in 0..300 {
+        html.push_str("<div><p>x</div>");
+    }
+    html.push_str("</body>");
+    assert!(to_markdown_bytes(html.as_bytes(), Some(Format::Html)).is_ok());
+}
+
+#[test]
+fn foreign_html_end_tags_pop_the_foreign_element() {
+    // Inside <svg>, html is an ordinary foreign element (not a breakout
+    // tag), so its end tag really pops it; keeping it open would accumulate
+    // phantom nesting and falsely hit the depth limit.
+    let mut html = String::from("<!doctype html><body><svg>");
+    for _ in 0..130 {
+        html.push_str("<html>x</html>");
+    }
+    html.push_str("</svg></body>");
+    assert!(to_markdown_bytes(html.as_bytes(), Some(Format::Html)).is_ok());
+}
