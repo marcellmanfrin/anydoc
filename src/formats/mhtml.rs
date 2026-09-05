@@ -375,6 +375,26 @@ fn preflight_encapsulated_message(
             max_entry_bytes,
             depth,
         )?;
+    } else if headers_are_message(headers) {
+        // Chains of message/rfc822 without multipart wrappers must keep
+        // being walked too, against the same depth budget.
+        let nested_depth = depth.saturating_add(1);
+        if nested_depth > limits::MAX_MIME_DEPTH {
+            return Err(ConvertError::ResourceLimit {
+                limit: "max_mime_depth",
+                detail: format!(
+                    "MHTML MIME nesting depth {nested_depth} exceeds maximum of {}",
+                    limits::MAX_MIME_DEPTH
+                ),
+            });
+        }
+        preflight_encapsulated_message(
+            bytes,
+            inner_body_start,
+            end,
+            max_entry_bytes,
+            nested_depth,
+        )?;
     }
     Ok(())
 }
@@ -724,7 +744,7 @@ fn collect_image_assets(
             id,
             media_type: format!("{}/{subtype}", content_type.ctype()),
             origin_part,
-            bytes: bytes.to_vec(),
+            bytes,
         });
         for key in resource_keys(part, resource_base) {
             image_assets.entry(key).or_insert(id);
@@ -1026,6 +1046,30 @@ mod tests {
             Err(ConvertError::ResourceLimit { limit: "max_entry_bytes", .. })
         ));
         assert!(preflight_base64_decoder_allocations_with_limit(input, 64).is_ok());
+    }
+
+    #[test]
+    fn encapsulated_message_chains_are_depth_checked() {
+        // 70 nested message/rfc822 levels without multipart wrappers must
+        // still hit the MIME depth budget.
+        let mut inner = Vec::from(
+            b"MIME-Version: 1.0\r\nContent-Type: text/html\r\n\r\n<p>leaf</p>\r\n".as_slice(),
+        );
+        for _ in 0..70 {
+            let mut next =
+                Vec::from(b"MIME-Version: 1.0\r\nContent-Type: message/rfc822\r\n\r\n".as_slice());
+            next.extend_from_slice(&inner);
+            inner = next;
+        }
+        let mut input = Vec::from(
+            "MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: message/rfc822\r\n\r\n".as_bytes(),
+        );
+        input.extend_from_slice(&inner);
+        input.extend_from_slice(b"\r\n--b--\r\n");
+        assert!(matches!(
+            preflight_base64_decoder_allocations(&input),
+            Err(ConvertError::ResourceLimit { limit: "max_mime_depth", .. })
+        ));
     }
 
     #[test]
