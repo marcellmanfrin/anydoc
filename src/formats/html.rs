@@ -249,7 +249,9 @@ impl TokenSink for HtmlComplexitySink {
                     // it must be taken before the new element is pushed, and
                     // it does not apply inside foreign content, where these
                     // names are ordinary elements whose children stay markup.
-                    // SVG script is the one exception that still switches.
+                    // html5ever 0.39 does not switch the tokenizer for script
+                    // inside foreign content either (its foreign_start_tag has
+                    // no ScriptData transition), so script is gated too.
                     let foreign = in_foreign_content(&self.open_elements.borrow());
                     if !is_void_html_element(name) && !honor_self_closing {
                         self.push_element(&tag.name);
@@ -259,7 +261,7 @@ impl TokenSink for HtmlComplexitySink {
                         "style" | "xmp" | "iframe" | "noembed" | "noframes" if !foreign => {
                             TokenSinkResult::RawData(Rawtext)
                         }
-                        "script" => TokenSinkResult::RawData(ScriptData),
+                        "script" if !foreign => TokenSinkResult::RawData(ScriptData),
                         "plaintext" if !foreign => TokenSinkResult::Plaintext,
                         _ => TokenSinkResult::Continue,
                     }
