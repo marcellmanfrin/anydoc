@@ -620,3 +620,47 @@ fn table_end_tag_respects_template_scope() {
     let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
     assert_preflight_depth_limit(error);
 }
+
+#[test]
+fn body_end_tag_does_not_pop_open_nesting() {
+    // html5ever keeps body open on </body> (mode switch only); truncating
+    // the modeled stack there would drop the 200 open divs and undercount
+    // the ones that follow.
+    let mut html = String::from("<!doctype html><body>");
+    for _ in 0..200 {
+        html.push_str("<div>");
+    }
+    html.push_str("</body>");
+    for _ in 0..200 {
+        html.push_str("<div>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    assert_preflight_depth_limit(error);
+}
+
+#[test]
+fn foreign_html_elements_are_not_treated_as_duplicate_wrappers() {
+    // <html> inside <svg> is an ordinary foreign element that html5ever
+    // pushes; skipping it as a duplicate wrapper would undercount depth.
+    let mut html = String::from("<!doctype html><body><svg>");
+    for _ in 0..300 {
+        html.push_str("<html>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    assert_preflight_depth_limit(error);
+}
+
+#[test]
+fn li_end_tag_ignores_buttons_and_closes_the_item() {
+    // button is not a list-item scope marker: </li> must still close the
+    // item (and the spans with it), keeping the later divs shallow.
+    let mut html = String::from("<!doctype html><body><ul><li><button>b</button>");
+    for _ in 0..130 {
+        html.push_str("<span>s");
+    }
+    html.push_str("</li></ul>");
+    for _ in 0..130 {
+        html.push_str("<div>");
+    }
+    assert!(to_markdown_bytes(html.as_bytes(), Some(Format::Html)).is_ok());
+}

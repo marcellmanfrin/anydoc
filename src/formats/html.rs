@@ -166,8 +166,11 @@ impl HtmlComplexitySink {
         let mut open = self.open_elements.borrow_mut();
         // html5ever ignores duplicate <html>/<body> start tags once those
         // wrappers exist; pushing them again would move the depth baseline
-        // used below and undercount every later descendant.
+        // used below and undercount every later descendant. Inside foreign
+        // content these names are ordinary foreign elements (html is not a
+        // breakout tag), so the suppression must not apply there.
         if matches!(name.as_ref(), "html" | "body")
+            && !in_foreign_content(&open)
             && open.iter().any(|candidate| candidate == name)
         {
             return;
@@ -196,6 +199,13 @@ impl HtmlComplexitySink {
     }
 
     fn close_element(&self, name: &LocalName) {
+        // html5ever never pops body/html on their end tags: it only switches
+        // insertion modes (after body / after after body) and later start
+        // tags keep nesting in the existing tree. Truncating here would drop
+        // real open nesting and undercount depth.
+        if matches!(name.as_ref(), "body" | "html") {
+            return;
+        }
         let mut open = self.open_elements.borrow_mut();
         // html5ever ignores an end tag whose element is not in scope; the
         // scope search stops at markers that depend on the end tag (table
@@ -320,7 +330,7 @@ fn is_end_tag_scope_marker(end_tag: &str, candidate: &str) -> bool {
         "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption" | "colgroup" => {
             matches!(candidate, "html" | "table" | "template")
         }
-        "li" => GENERIC.contains(&candidate) || matches!(candidate, "button" | "ol" | "ul"),
+        "li" => GENERIC.contains(&candidate) || matches!(candidate, "ol" | "ul"),
         "p" => GENERIC.contains(&candidate) || candidate == "button",
         _ => GENERIC.contains(&candidate),
     }
@@ -336,8 +346,8 @@ fn close_implied_before_start(open: &mut Vec<LocalName>, name: &str) {
     // HTML5 implicitly closes an open <p> when a block-level start tag
     // arrives. Model the case where the <p> is the innermost open element;
     // deeper arrangements stay over-counted, keeping the preflight
-    // fail-closed. (hr also closes <p> in HTML5 but is void, so it never
-    // reaches this hook; the leftover <p> only over-counts.)
+    // fail-closed. Void tags reach this hook through close_implied (so <hr>
+    // does close an open <p>) without being pushed themselves.
     if is_paragraph_closing_element(name)
         && open.last().is_some_and(|candidate| candidate.as_ref() == "p")
     {
