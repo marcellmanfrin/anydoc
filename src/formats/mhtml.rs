@@ -581,7 +581,9 @@ fn transfer_decoded_part_bytes(
             })?
         }
         Encoding::Base64 => {
-            enforce_part_size(raw.len(), label, "base64 encoded body")?;
+            // base64 expands data by 4/3, so a valid part whose decoded size
+            // fits max_entry_bytes can still have a larger encoded body; the
+            // decoded upper bound below is the meaningful limit here.
             let upper_bound = base64_decoded_upper_bound(raw);
             if upper_bound > limits::MAX_ENTRY_BYTES {
                 return Err(ConvertError::ResourceLimit {
