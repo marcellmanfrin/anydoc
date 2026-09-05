@@ -309,8 +309,8 @@ fn repeated_unclosed_anchors_do_not_trigger_depth_limit() {
     }
     let result = to_markdown_bytes(html.as_bytes(), Some(Format::Html));
     assert!(
-        !matches!(result, Err(ConvertError::ResourceLimit { limit: "max_xml_depth", .. })),
-        "HTML5 repairs repeated anchors; preflight must not reject them as excessive depth"
+        result.is_ok(),
+        "HTML5 repairs repeated anchors; preflight must not reject them: {result:?}"
     );
 }
 
@@ -538,4 +538,81 @@ fn template_body_does_not_capture_document_conversion() {
     let html = br#"<!doctype html><html><head><template><body>template body</body></template></head><body><p>real body</p></body></html>"#;
     let markdown = to_markdown_bytes(html, Some(Format::Html)).unwrap();
     assert_eq!(markdown, "real body\n");
+}
+
+#[test]
+fn depth_limit_aligns_with_the_post_parse_walk_at_the_boundary() {
+    // 255 nested divs under an explicit body sit exactly at the limit the
+    // DOM walk accepts (body = depth 1, innermost div = depth 256).
+    let mut ok = String::from("<!doctype html><html><body>");
+    for _ in 0..255 {
+        ok.push_str("<div>");
+    }
+    ok.push_str("x</body></html>");
+    assert!(to_markdown_bytes(ok.as_bytes(), Some(Format::Html)).is_ok());
+
+    // One more level exceeds it and must be rejected before DOM construction.
+    let mut too_deep = String::from("<!doctype html><html><body>");
+    for _ in 0..256 {
+        too_deep.push_str("<div>");
+    }
+    too_deep.push_str("x</body></html>");
+    let error = to_markdown_bytes(too_deep.as_bytes(), Some(Format::Html)).unwrap_err();
+    match error {
+        ConvertError::ResourceLimit { limit: "max_xml_depth", detail } => {
+            assert!(detail.contains("before DOM construction"), "unexpected detail: {detail}");
+        }
+        other => panic!("expected max_xml_depth, got {other:?}"),
+    }
+}
+
+#[test]
+fn void_hr_closes_open_paragraph_in_preflight() {
+    let mut html = String::from("<!doctype html><body>");
+    for _ in 0..300 {
+        html.push_str("<p>x<hr>");
+    }
+    html.push_str("</body>");
+    assert!(to_markdown_bytes(html.as_bytes(), Some(Format::Html)).is_ok());
+}
+
+#[test]
+fn foreign_void_elements_are_pushed_and_counted() {
+    // Void HTML names that are not foreign-content breakout tags (input,
+    // param, source, ...) are ordinary foreign elements inside <svg> that
+    // html5ever pushes; 300 of them nest and must be rejected before DOM
+    // construction.
+    let mut html = String::from("<!doctype html><body><svg>");
+    for _ in 0..300 {
+        html.push_str("<input>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    match error {
+        ConvertError::ResourceLimit { limit: "max_xml_depth", detail } => {
+            assert!(detail.contains("before DOM construction"), "unexpected detail: {detail}");
+        }
+        other => panic!("expected max_xml_depth, got {other:?}"),
+    }
+}
+
+#[test]
+fn out_of_scope_end_tag_does_not_pop_real_nesting() {
+    // html5ever ignores </div> here (a td scope marker sits above the div),
+    // so the spans keep nesting; the preflight must not truncate the stack
+    // on the ignored end tag.
+    let mut html = String::from("<!doctype html><body><div><table><td>");
+    for _ in 0..200 {
+        html.push_str("<span>");
+    }
+    html.push_str("</div>");
+    for _ in 0..100 {
+        html.push_str("<span>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    match error {
+        ConvertError::ResourceLimit { limit: "max_xml_depth", detail } => {
+            assert!(detail.contains("before DOM construction"), "unexpected detail: {detail}");
+        }
+        other => panic!("expected max_xml_depth, got {other:?}"),
+    }
 }

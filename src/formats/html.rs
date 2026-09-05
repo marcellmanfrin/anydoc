@@ -190,6 +190,13 @@ impl HtmlComplexitySink {
         }
     }
 
+    fn close_implied(&self, name: &str) {
+        let mut open = self.open_elements.borrow_mut();
+        if !in_foreign_content(&open) {
+            close_implied_before_start(&mut open, name);
+        }
+    }
+
     fn push_element(&self, name: &LocalName) {
         let mut open = self.open_elements.borrow_mut();
         // HTML implied-end-tag rules only apply in HTML content; inside
@@ -199,15 +206,56 @@ impl HtmlComplexitySink {
             close_implied_before_start(&mut open, name.as_ref());
         }
         open.push(name.clone());
-        if open.len() > limits::MAX_XML_DEPTH {
+        // Count depth the way the post-parse walk will: adapt_element treats
+        // the body element as depth 1, and html5ever auto-inserts html/body
+        // wrappers that may never appear as tokens.
+        let wrapper = open
+            .iter()
+            .rposition(|candidate| candidate.as_ref() == "body")
+            .or_else(|| open.iter().rposition(|candidate| candidate.as_ref() == "html"));
+        let depth = match wrapper {
+            Some(index) => open.len() - index,
+            None => open.len() + 1,
+        };
+        if depth > limits::MAX_XML_DEPTH {
             self.depth_limit_exceeded.set(true);
         }
     }
 
     fn close_element(&self, name: &LocalName) {
         let mut open = self.open_elements.borrow_mut();
-        if let Some(position) = open.iter().rposition(|candidate| candidate == name) {
-            open.truncate(position);
+        // html5ever ignores an end tag whose element is not in scope; scope
+        // markers stop the search. Truncating on an out-of-scope match would
+        // pop real nesting and undercount depth. Table-family end tags use
+        // the narrower table scope.
+        let table_scope = matches!(
+            name.as_ref(),
+            "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption" | "colgroup"
+        );
+        for (position, candidate) in open.iter().enumerate().rev() {
+            if candidate == name {
+                open.truncate(position);
+                return;
+            }
+            let is_marker = if table_scope {
+                matches!(candidate.as_ref(), "html" | "table")
+            } else {
+                matches!(
+                    candidate.as_ref(),
+                    "applet"
+                        | "caption"
+                        | "html"
+                        | "table"
+                        | "td"
+                        | "th"
+                        | "marquee"
+                        | "object"
+                        | "template"
+                )
+            };
+            if is_marker {
+                return;
+            }
         }
     }
 
@@ -263,7 +311,13 @@ impl TokenSink for HtmlComplexitySink {
                     // inside foreign content either (its foreign_start_tag has
                     // no ScriptData transition), so script is gated too.
                     let foreign = in_foreign_content(&self.open_elements.borrow());
-                    if !is_void_html_element(name) && !honor_self_closing {
+                    if is_void_html_element(name) && !foreign {
+                        // Void HTML elements never push, but their start tags
+                        // still run the implied-end-tag rules (hr closes p).
+                        self.close_implied(name);
+                    } else if !honor_self_closing {
+                        // Inside foreign content, void HTML names are ordinary
+                        // foreign elements that html5ever pushes.
                         self.push_element(&tag.name);
                     }
                     match name {
