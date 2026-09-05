@@ -385,12 +385,7 @@ fn foreign_content_breakout_does_not_bypass_depth_limit() {
         html.push_str("<path/>");
     }
     let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
-    match error {
-        ConvertError::ResourceLimit { limit: "max_xml_depth", detail } => {
-            assert!(detail.contains("before DOM construction"), "unexpected detail: {detail}");
-        }
-        other => panic!("expected max_xml_depth, got {other:?}"),
-    }
+    assert_preflight_depth_limit(error);
 }
 
 #[test]
@@ -405,12 +400,7 @@ fn headings_with_open_inlines_are_rejected_before_dom_construction() {
     }
     html.push_str("</body>");
     let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
-    match error {
-        ConvertError::ResourceLimit { limit: "max_xml_depth", detail } => {
-            assert!(detail.contains("before DOM construction"), "unexpected detail: {detail}");
-        }
-        other => panic!("expected max_xml_depth, got {other:?}"),
-    }
+    assert_preflight_depth_limit(error);
 }
 
 #[test]
@@ -454,12 +444,7 @@ fn foreign_content_title_does_not_swallow_nested_markup() {
         html.push_str("<div>");
     }
     let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
-    match error {
-        ConvertError::ResourceLimit { limit: "max_xml_depth", detail } => {
-            assert!(detail.contains("before DOM construction"), "unexpected detail: {detail}");
-        }
-        other => panic!("expected max_xml_depth, got {other:?}"),
-    }
+    assert_preflight_depth_limit(error);
 }
 
 #[test]
@@ -482,12 +467,7 @@ fn foreign_content_script_does_not_swallow_nested_markup() {
     }
     html.push_str("</script></svg></body>");
     let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
-    match error {
-        ConvertError::ResourceLimit { limit: "max_xml_depth", detail } => {
-            assert!(detail.contains("before DOM construction"), "unexpected detail: {detail}");
-        }
-        other => panic!("expected max_xml_depth, got {other:?}"),
-    }
+    assert_preflight_depth_limit(error);
 }
 
 #[test]
@@ -507,12 +487,7 @@ fn foreign_content_option_tags_do_not_get_html_implied_closes() {
         html.push_str("<option>");
     }
     let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
-    match error {
-        ConvertError::ResourceLimit { limit: "max_xml_depth", detail } => {
-            assert!(detail.contains("before DOM construction"), "unexpected detail: {detail}");
-        }
-        other => panic!("expected max_xml_depth, got {other:?}"),
-    }
+    assert_preflight_depth_limit(error);
 }
 
 #[test]
@@ -525,12 +500,7 @@ fn nested_foreign_roots_fully_exit_on_breakout() {
         html.push_str("<path/>");
     }
     let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
-    match error {
-        ConvertError::ResourceLimit { limit: "max_xml_depth", detail } => {
-            assert!(detail.contains("before DOM construction"), "unexpected detail: {detail}");
-        }
-        other => panic!("expected max_xml_depth, got {other:?}"),
-    }
+    assert_preflight_depth_limit(error);
 }
 
 #[test]
@@ -558,12 +528,7 @@ fn depth_limit_aligns_with_the_post_parse_walk_at_the_boundary() {
     }
     too_deep.push_str("x</body></html>");
     let error = to_markdown_bytes(too_deep.as_bytes(), Some(Format::Html)).unwrap_err();
-    match error {
-        ConvertError::ResourceLimit { limit: "max_xml_depth", detail } => {
-            assert!(detail.contains("before DOM construction"), "unexpected detail: {detail}");
-        }
-        other => panic!("expected max_xml_depth, got {other:?}"),
-    }
+    assert_preflight_depth_limit(error);
 }
 
 #[test]
@@ -587,12 +552,7 @@ fn foreign_void_elements_are_pushed_and_counted() {
         html.push_str("<input>");
     }
     let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
-    match error {
-        ConvertError::ResourceLimit { limit: "max_xml_depth", detail } => {
-            assert!(detail.contains("before DOM construction"), "unexpected detail: {detail}");
-        }
-        other => panic!("expected max_xml_depth, got {other:?}"),
-    }
+    assert_preflight_depth_limit(error);
 }
 
 #[test]
@@ -609,10 +569,54 @@ fn out_of_scope_end_tag_does_not_pop_real_nesting() {
         html.push_str("<span>");
     }
     let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
-    match error {
-        ConvertError::ResourceLimit { limit: "max_xml_depth", detail } => {
-            assert!(detail.contains("before DOM construction"), "unexpected detail: {detail}");
-        }
-        other => panic!("expected max_xml_depth, got {other:?}"),
+    assert_preflight_depth_limit(error);
+}
+
+#[test]
+fn duplicate_body_tag_does_not_move_the_depth_baseline() {
+    // html5ever ignores the second <body>; if the preflight pushed it, the
+    // body-relative depth baseline would move up and undercount the divs.
+    let mut html = String::from("<!doctype html><body>");
+    for _ in 0..130 {
+        html.push_str("<div>");
     }
+    html.push_str("<body>");
+    for _ in 0..130 {
+        html.push_str("<div>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    assert_preflight_depth_limit(error);
+}
+
+#[test]
+fn paragraph_end_tag_respects_button_scope() {
+    // A <button> above the open <p> puts it out of button scope, so
+    // html5ever leaves the stack alone for </p>; truncating there would pop
+    // the button and the 150 nested divs and undercount the later divs.
+    let mut html = String::from("<!doctype html><body><p><button>");
+    for _ in 0..150 {
+        html.push_str("<div>");
+    }
+    html.push_str("</p>");
+    for _ in 0..150 {
+        html.push_str("<div>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    assert_preflight_depth_limit(error);
+}
+
+#[test]
+fn table_end_tag_respects_template_scope() {
+    // template is a table-scope marker: html5ever ignores </table> while the
+    // template is above it, so the spans keep nesting.
+    let mut html = String::from("<!doctype html><body><table><template>");
+    for _ in 0..100 {
+        html.push_str("<span>");
+    }
+    html.push_str("</table>");
+    for _ in 0..160 {
+        html.push_str("<span>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    assert_preflight_depth_limit(error);
 }

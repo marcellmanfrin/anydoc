@@ -164,6 +164,14 @@ impl HtmlComplexitySink {
 
     fn push_element(&self, name: &LocalName) {
         let mut open = self.open_elements.borrow_mut();
+        // html5ever ignores duplicate <html>/<body> start tags once those
+        // wrappers exist; pushing them again would move the depth baseline
+        // used below and undercount every later descendant.
+        if matches!(name.as_ref(), "html" | "body")
+            && open.iter().any(|candidate| candidate == name)
+        {
+            return;
+        }
         // HTML implied-end-tag rules only apply in HTML content; inside
         // foreign content names like option/tr are ordinary elements and
         // closing them here would undercount real nesting.
@@ -189,36 +197,19 @@ impl HtmlComplexitySink {
 
     fn close_element(&self, name: &LocalName) {
         let mut open = self.open_elements.borrow_mut();
-        // html5ever ignores an end tag whose element is not in scope; scope
-        // markers stop the search. Truncating on an out-of-scope match would
-        // pop real nesting and undercount depth. Table-family end tags use
-        // the narrower table scope.
-        let table_scope = matches!(
-            name.as_ref(),
-            "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption" | "colgroup"
-        );
+        // html5ever ignores an end tag whose element is not in scope; the
+        // scope search stops at markers that depend on the end tag (table
+        // scope for the table family, list-item scope for li, button scope
+        // for p) and at svg/math foreign roots for every HTML end tag.
+        // Truncating on an out-of-scope match would pop real nesting and
+        // undercount depth.
+        let name = name.as_ref();
         for (position, candidate) in open.iter().enumerate().rev() {
-            if candidate == name {
+            if candidate.as_ref() == name {
                 open.truncate(position);
                 return;
             }
-            let is_marker = if table_scope {
-                matches!(candidate.as_ref(), "html" | "table")
-            } else {
-                matches!(
-                    candidate.as_ref(),
-                    "applet"
-                        | "caption"
-                        | "html"
-                        | "table"
-                        | "td"
-                        | "th"
-                        | "marquee"
-                        | "object"
-                        | "template"
-                )
-            };
-            if is_marker {
+            if is_end_tag_scope_marker(name, candidate.as_ref()) {
                 return;
             }
         }
@@ -312,6 +303,26 @@ impl TokenSink for HtmlComplexitySink {
             }
             Token::EOFToken | Token::ParseError(_) => TokenSinkResult::Continue,
         }
+    }
+}
+
+/// Scope markers that stop the search for an end tag's target element,
+/// mirroring html5ever's scope rules. Foreign roots (svg, math) end every
+/// HTML scope search; HTML integration points (desc, title, foreignObject,
+/// annotation-xml, mi/mo/mn/ms/mtext) deliberately do not.
+fn is_end_tag_scope_marker(end_tag: &str, candidate: &str) -> bool {
+    if matches!(candidate, "svg" | "math") {
+        return true;
+    }
+    const GENERIC: &[&str] =
+        &["applet", "caption", "html", "table", "td", "th", "marquee", "object", "template"];
+    match end_tag {
+        "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption" | "colgroup" => {
+            matches!(candidate, "html" | "table" | "template")
+        }
+        "li" => GENERIC.contains(&candidate) || matches!(candidate, "button" | "ol" | "ul"),
+        "p" => GENERIC.contains(&candidate) || candidate == "button",
+        _ => GENERIC.contains(&candidate),
     }
 }
 
