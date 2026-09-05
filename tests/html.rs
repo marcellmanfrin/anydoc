@@ -470,3 +470,29 @@ fn html_title_still_swallows_markup_as_raw_text() {
     let markdown = to_markdown_bytes(html, Some(Format::Html)).unwrap();
     assert!(markdown.contains("ok"), "got: {markdown:?}");
 }
+
+#[test]
+fn foreign_content_script_does_not_swallow_nested_markup() {
+    // html5ever does not switch the tokenizer to ScriptData for scripts
+    // inside foreign content, so nested markup inside <svg><script> really
+    // becomes elements and the preflight must count it.
+    let mut html = String::from("<!doctype html><body><svg><script>");
+    for _ in 0..300 {
+        html.push_str("<div>");
+    }
+    html.push_str("</script></svg></body>");
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    match error {
+        ConvertError::ResourceLimit { limit: "max_xml_depth", detail } => {
+            assert!(detail.contains("before DOM construction"), "unexpected detail: {detail}");
+        }
+        other => panic!("expected max_xml_depth, got {other:?}"),
+    }
+}
+
+#[test]
+fn html_script_still_swallows_markup_as_script_data() {
+    let html = br#"<!doctype html><html><head><script>var x = "<div>";</script></head><body><p>ok</p></body></html>"#;
+    let markdown = to_markdown_bytes(html, Some(Format::Html)).unwrap();
+    assert!(markdown.contains("ok"), "got: {markdown:?}");
+}
