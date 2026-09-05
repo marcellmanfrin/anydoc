@@ -367,6 +367,9 @@ fn preflight_encapsulated_message(
     }
 
     if let Some(boundary) = mime_boundary_from_headers(headers)? {
+        // Multipart bodies are scanned raw on purpose: RFC 2046 forbids
+        // transfer encodings on multipart, and mail-parser looks for the
+        // boundary in the undecoded bytes, so the preflight must too.
         preflight_multipart_base64(
             bytes,
             inner_body_start,
@@ -377,7 +380,11 @@ fn preflight_encapsulated_message(
         )?;
     } else if headers_are_message(headers) {
         // Chains of message/rfc822 without multipart wrappers must keep
-        // being walked too, against the same depth budget.
+        // being walked too, against the same depth budget. A
+        // transfer-encoded encapsulated body only reveals the next chain
+        // link after decoding (mail-parser decodes recursively), so the
+        // walk continues on the decoded bytes; the encoded size is already
+        // bounded above and the decoded upper bound is enforced here.
         let nested_depth = depth.saturating_add(1);
         if nested_depth > limits::MAX_MIME_DEPTH {
             return Err(ConvertError::ResourceLimit {
@@ -388,13 +395,51 @@ fn preflight_encapsulated_message(
                 ),
             });
         }
-        preflight_encapsulated_message(
-            bytes,
-            inner_body_start,
-            end,
-            max_entry_bytes,
-            nested_depth,
-        )?;
+        let mut encoded_end = end;
+        if bytes.get(encoded_end.saturating_sub(2)..encoded_end) == Some(b"\r\n") {
+            encoded_end -= 2;
+        } else if bytes.get(encoded_end.saturating_sub(1)..encoded_end) == Some(b"\n") {
+            encoded_end -= 1;
+        }
+        let body_region = &bytes[inner_body_start..encoded_end];
+        if headers_use_base64(headers) {
+            let upper_bound = base64_decoded_upper_bound(body_region);
+            if upper_bound > max_entry_bytes {
+                return Err(ConvertError::ResourceLimit {
+                    limit: "max_entry_bytes",
+                    detail: format!(
+                        "MHTML encapsulated message base64 body can decode to at most {upper_bound} bytes; maximum is {max_entry_bytes}"
+                    ),
+                });
+            }
+            if let Some(decoded) = base64_decode(body_region) {
+                preflight_encapsulated_message(
+                    &decoded,
+                    0,
+                    decoded.len(),
+                    max_entry_bytes,
+                    nested_depth,
+                )?;
+            }
+        } else if headers_use_quoted_printable(headers) {
+            if let Some(decoded) = quoted_printable_decode(body_region) {
+                preflight_encapsulated_message(
+                    &decoded,
+                    0,
+                    decoded.len(),
+                    max_entry_bytes,
+                    nested_depth,
+                )?;
+            }
+        } else {
+            preflight_encapsulated_message(
+                bytes,
+                inner_body_start,
+                end,
+                max_entry_bytes,
+                nested_depth,
+            )?;
+        }
     }
     Ok(())
 }
@@ -1061,6 +1106,82 @@ mod tests {
             let mut next =
                 Vec::from(b"MIME-Version: 1.0\r\nContent-Type: message/rfc822\r\n\r\n".as_slice());
             next.extend_from_slice(&inner);
+            inner = next;
+        }
+        let mut input = Vec::from(
+            "MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: message/rfc822\r\n\r\n".as_bytes(),
+        );
+        input.extend_from_slice(&inner);
+        input.extend_from_slice(b"\r\n--b--\r\n");
+        assert!(matches!(
+            preflight_base64_decoder_allocations(&input),
+            Err(ConvertError::ResourceLimit { limit: "max_mime_depth", .. })
+        ));
+    }
+
+    #[test]
+    fn encoded_rfc822_chains_below_the_first_level_are_depth_checked() {
+        // Every other chain level hides behind base64: an encapsulated
+        // message only reveals the next link after decoding, so the
+        // preflight must decode before recursing. Otherwise the walk stops
+        // at the first encoded level (no MIME headers are visible in the
+        // base64 text) while mail-parser keeps nesting.
+        let mut inner = Vec::from(
+            b"MIME-Version: 1.0\r\nContent-Type: text/html\r\n\r\n<p>leaf</p>\r\n".as_slice(),
+        );
+        for level in 0..70 {
+            let mut next =
+                Vec::from(b"MIME-Version: 1.0\r\nContent-Type: message/rfc822\r\n".as_slice());
+            if level % 2 == 0 {
+                next.extend_from_slice(b"Content-Transfer-Encoding: base64\r\n\r\n");
+                next.extend_from_slice(base64_for_test(&inner).as_bytes());
+            } else {
+                next.extend_from_slice(b"\r\n");
+                next.extend_from_slice(&inner);
+            }
+            inner = next;
+        }
+        let mut input = Vec::from(
+            "MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: message/rfc822\r\n\r\n".as_bytes(),
+        );
+        input.extend_from_slice(&inner);
+        input.extend_from_slice(b"\r\n--b--\r\n");
+        assert!(matches!(
+            preflight_base64_decoder_allocations(&input),
+            Err(ConvertError::ResourceLimit { limit: "max_mime_depth", .. })
+        ));
+    }
+
+    /// Quote every colon as =3A so the wrapped bytes no longer expose MIME
+    /// headers to a raw scan; valid quoted-printable that decodes back to
+    /// the original message.
+    fn qp_escape_colons(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len());
+        for byte in data {
+            if *byte == b':' {
+                out.extend_from_slice(b"=3A");
+            } else {
+                out.push(*byte);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn quoted_printable_rfc822_chains_are_depth_checked() {
+        // Each level's payload has its colons quoted-printable-escaped, so
+        // the next chain link is only visible after decoding; the preflight
+        // must decode quoted-printable encapsulated bodies before recursing
+        // or the depth budget stops at the first encoded level.
+        let mut inner = Vec::from(
+            b"MIME-Version: 1.0\r\nContent-Type: text/html\r\n\r\n<p>leaf</p>\r\n".as_slice(),
+        );
+        for _ in 0..70 {
+            let mut next = Vec::from(
+                b"MIME-Version: 1.0\r\nContent-Type: message/rfc822\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n"
+                    .as_slice(),
+            );
+            next.extend_from_slice(&qp_escape_colons(&inner));
             inner = next;
         }
         let mut input = Vec::from(
