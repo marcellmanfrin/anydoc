@@ -772,3 +772,23 @@ fn foreign_html_end_tags_pop_the_foreign_element() {
     html.push_str("</svg></body>");
     assert!(to_markdown_bytes(html.as_bytes(), Some(Format::Html)).is_ok());
 }
+
+#[test]
+fn scope_end_tags_do_not_pop_through_open_foreign_roots() {
+    // While an svg root is open html5ever processes end tags in the
+    // foreign-content phase: the walk stops at the first HTML element below
+    // the root and ignores the token, so the p under the svg stays open and
+    // the paths keep nesting. A scope search that treated bare svg/math as
+    // pass-through (the in-body default_scope marker set) would truncate
+    // through the root and undercount depth; this pins the root stop.
+    let mut html = String::from("<!doctype html><body><p><svg><g>");
+    for _ in 0..130 {
+        html.push_str("<path>");
+    }
+    html.push_str("</p>");
+    for _ in 0..130 {
+        html.push_str("<path>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    assert_preflight_depth_limit(error);
+}
