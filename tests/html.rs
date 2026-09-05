@@ -496,3 +496,46 @@ fn html_script_still_swallows_markup_as_script_data() {
     let markdown = to_markdown_bytes(html, Some(Format::Html)).unwrap();
     assert!(markdown.contains("ok"), "got: {markdown:?}");
 }
+
+#[test]
+fn foreign_content_option_tags_do_not_get_html_implied_closes() {
+    // Inside <svg>, repeated <option> elements are ordinary foreign elements
+    // that genuinely nest; the preflight must not apply the HTML select
+    // insertion rule there.
+    let mut html = String::from("<!doctype html><body><svg>");
+    for _ in 0..300 {
+        html.push_str("<option>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    match error {
+        ConvertError::ResourceLimit { limit: "max_xml_depth", detail } => {
+            assert!(detail.contains("before DOM construction"), "unexpected detail: {detail}");
+        }
+        other => panic!("expected max_xml_depth, got {other:?}"),
+    }
+}
+
+#[test]
+fn nested_foreign_roots_fully_exit_on_breakout() {
+    // html5ever pops every foreign root on a breakout tag; leaving the outer
+    // svg on the modeled stack would treat later <path/> tags as foreign
+    // self-closing and bypass the depth guard.
+    let mut html = String::from("<!doctype html><body><svg><math><p>");
+    for _ in 0..300 {
+        html.push_str("<path/>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    match error {
+        ConvertError::ResourceLimit { limit: "max_xml_depth", detail } => {
+            assert!(detail.contains("before DOM construction"), "unexpected detail: {detail}");
+        }
+        other => panic!("expected max_xml_depth, got {other:?}"),
+    }
+}
+
+#[test]
+fn template_body_does_not_capture_document_conversion() {
+    let html = br#"<!doctype html><html><head><template><body>template body</body></template></head><body><p>real body</p></body></html>"#;
+    let markdown = to_markdown_bytes(html, Some(Format::Html)).unwrap();
+    assert_eq!(markdown, "real body\n");
+}

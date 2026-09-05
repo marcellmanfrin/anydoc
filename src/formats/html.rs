@@ -157,7 +157,12 @@ impl HtmlComplexitySink {
 
     fn push_element(&self, name: &LocalName) {
         let mut open = self.open_elements.borrow_mut();
-        close_implied_before_start(&mut open, name.as_ref());
+        // HTML implied-end-tag rules only apply in HTML content; inside
+        // foreign content names like option/tr are ordinary elements and
+        // closing them here would undercount real nesting.
+        if !in_foreign_content(&open) {
+            close_implied_before_start(&mut open, name.as_ref());
+        }
         open.push(name.clone());
         if open.len() > limits::MAX_XML_DEPTH {
             self.depth_limit_exceeded.set(true);
@@ -177,16 +182,21 @@ impl HtmlComplexitySink {
     /// semantics, so the stack is left untouched in that case.
     fn pop_foreign_breakout(&self) {
         let mut open = self.open_elements.borrow_mut();
+        // html5ever pops until the current node is an HTML integration point
+        // or an HTML element, so nested foreign roots (svg inside math, etc.)
+        // all leave the stack. Track the outermost svg/math reachable from the
+        // top without crossing an integration point, and truncate there.
+        let mut outermost = None;
         for (index, candidate) in open.iter().enumerate().rev() {
             match candidate.as_ref() {
                 "foreignobject" | "desc" | "title" | "mi" | "mo" | "mn" | "ms" | "mtext"
-                | "annotation-xml" => return,
-                "svg" | "math" => {
-                    open.truncate(index);
-                    return;
-                }
+                | "annotation-xml" => break,
+                "svg" | "math" => outermost = Some(index),
                 _ => {}
             }
+        }
+        if let Some(index) = outermost {
+            open.truncate(index);
         }
     }
 }
