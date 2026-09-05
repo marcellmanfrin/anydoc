@@ -483,13 +483,25 @@ fn skip_boundary_line(bytes: &[u8], mut offset: usize, end: usize) -> usize {
 fn is_delimiter_end(bytes: &[u8], marker_end: usize) -> bool {
     // RFC 2046 allows transport padding (spaces/tabs) between the boundary
     // and the line ending, and skip_boundary_line accepts the same padding,
-    // so delimiter matching must accept it too.
+    // so delimiter matching must accept it too. For the closing delimiter the
+    // padding may follow the trailing dashes, which must still end the line
+    // or the input; otherwise body text like "--b--junk" would end the walk
+    // early and leave later parts unbounded.
     let mut index = marker_end;
     while matches!(bytes.get(index), Some(b' ') | Some(b'\t')) {
         index += 1;
     }
-    matches!(bytes.get(index), Some(b'\r') | Some(b'\n'))
-        || bytes.get(index..index + 2) == Some(b"--")
+    if matches!(bytes.get(index), Some(b'\r') | Some(b'\n')) {
+        return true;
+    }
+    if bytes.get(index..index + 2) == Some(b"--") {
+        index += 2;
+        while matches!(bytes.get(index), Some(b' ') | Some(b'\t')) {
+            index += 1;
+        }
+        return index == bytes.len() || matches!(bytes.get(index), Some(b'\r') | Some(b'\n'));
+    }
+    false
 }
 
 /// Find the next proper delimiter for the boundary marker in bytes[start..end].
@@ -792,7 +804,7 @@ fn resolve_resource_reference(base: Option<&str>, value: &str) -> String {
         };
         return format!("{}{}", normalize_url_path(&joined), suffix);
     };
-    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     let base_with_suffix = if authority_end < rest.len() { &rest[authority_end..] } else { "/" };
     let (base_path, _) = split_path_suffix(base_with_suffix);
@@ -1014,6 +1026,18 @@ mod tests {
             Err(ConvertError::ResourceLimit { limit: "max_entry_bytes", .. })
         ));
         assert!(preflight_base64_decoder_allocations_with_limit(input, 64).is_ok());
+    }
+
+    #[test]
+    fn fake_close_delimiter_in_preamble_does_not_end_the_walk() {
+        // "--b--junk" is not a closing delimiter (no line end after the
+        // dashes), so the walk must continue to the real parts and bound the
+        // quoted-printable body (26 bytes > 16).
+        let input = b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"b\"\r\n\r\npreamble --b--junk\r\n--b\r\nContent-Type: text/html\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n0123456789abcdefghijklmnop\r\n--b--\r\n";
+        assert!(matches!(
+            preflight_base64_decoder_allocations_with_limit(input, 16),
+            Err(ConvertError::ResourceLimit { limit: "max_entry_bytes", .. })
+        ));
     }
 
     #[test]

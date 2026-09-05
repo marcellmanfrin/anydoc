@@ -758,3 +758,35 @@ Content-Transfer-Encoding: base64
     let error = to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap_err();
     assert!(matches!(error, ConvertError::Malformed { .. }), "got {error:?}");
 }
+
+#[test]
+fn root_location_query_does_not_break_relative_resolution() {
+    let mhtml = mhtml_fixture(
+        r#"MIME-Version: 1.0
+Content-Type: multipart/related; boundary="b"
+
+--b
+Content-Type: text/html; charset=utf-8
+Content-Location: https://example.test?q=1
+
+<!doctype html><p><img alt="pixel" src="img.png"></p>
+--b
+Content-Type: image/png
+Content-Location: https://example.test/img.png
+
+PNGDATA
+--b--
+"#,
+    );
+    // The root location has an empty path plus a query; the authority parse
+    // must stop at "?" so "img.png" joins to https://example.test/img.png
+    // and resolves to the embedded part.
+    let document = to_document(&mhtml, Some(Format::Mhtml)).unwrap();
+    assert_eq!(document.assets.len(), 1);
+    match &document.blocks[0] {
+        Block::Paragraph(inlines) => {
+            assert!(matches!(&inlines[0], Inline::Image { source: ImageSource::Asset(_), .. }))
+        }
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
