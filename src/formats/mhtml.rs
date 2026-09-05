@@ -643,6 +643,11 @@ fn collect_stylesheets_in_order(
                 if !part.is_content_type("text", "css") {
                     continue;
                 }
+                if part.is_encoding_problem {
+                    return Err(ConvertError::malformed(
+                        "MHTML stylesheet transfer encoding is invalid",
+                    ));
+                }
                 let Some(css) = part.text_contents() else {
                     continue;
                 };

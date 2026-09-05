@@ -735,3 +735,26 @@ PNGDATA
         other => panic!("expected paragraph, got {other:?}"),
     }
 }
+
+#[test]
+fn stylesheet_with_broken_encoding_is_rejected() {
+    let mhtml = mhtml_fixture(
+        r#"MIME-Version: 1.0
+Content-Type: multipart/related; boundary="b"
+
+--b
+Content-Type: text/html; charset=utf-8
+
+<!doctype html><link rel="stylesheet" href="style.css"><p>x</p>
+--b
+Content-Type: text/css
+Content-Location: style.css
+Content-Transfer-Encoding: base64
+
+!!!!not-base64!!!!
+--b--
+"#,
+    );
+    let error = to_markdown_bytes(&mhtml, Some(Format::Mhtml)).unwrap_err();
+    assert!(matches!(error, ConvertError::Malformed { .. }), "got {error:?}");
+}
