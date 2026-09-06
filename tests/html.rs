@@ -774,13 +774,13 @@ fn foreign_html_end_tags_pop_the_foreign_element() {
 }
 
 #[test]
-fn scope_end_tags_do_not_pop_through_open_foreign_roots() {
-    // While an svg root is open html5ever processes end tags in the
-    // foreign-content phase: the walk stops at the first HTML element below
-    // the root and ignores the token, so the p under the svg stays open and
-    // the paths keep nesting. A scope search that treated bare svg/math as
-    // pass-through (the in-body default_scope marker set) would truncate
-    // through the root and undercount depth; this pins the root stop.
+fn scope_end_tags_pop_through_foreign_roots_to_their_target() {
+    // html5ever routes </p> through the foreign-content walk and then
+    // reprocesses it in body mode, where bare svg/math are not scope
+    // markers: the p below the svg is in button scope, so the parser pops
+    // the paths, the g, the svg, and the p. The preflight must pop too, or
+    // it falsely rejects with max_xml_depth a document that converts (max
+    // depth ~134 here).
     let mut html = String::from("<!doctype html><body><p><svg><g>");
     for _ in 0..130 {
         html.push_str("<path>");
@@ -788,6 +788,24 @@ fn scope_end_tags_do_not_pop_through_open_foreign_roots() {
     html.push_str("</p>");
     for _ in 0..130 {
         html.push_str("<path>");
+    }
+    assert!(to_markdown_bytes(html.as_bytes(), Some(Format::Html)).is_ok());
+}
+
+#[test]
+fn unmatched_end_tags_still_stop_at_special_elements_below_foreign_roots() {
+    // The reprocessed walk stops at the special p: no span matches above
+    // it, so html5ever ignores </span> and the foreign nesting keeps
+    // growing; the preflight must reject before DOM construction. Bare
+    // svg/math do not stop that walk either — the special p below them
+    // does.
+    let mut html = String::from("<!doctype html><body><p><svg>");
+    for _ in 0..130 {
+        html.push_str("<g>");
+    }
+    html.push_str("</span>");
+    for _ in 0..130 {
+        html.push_str("<g>");
     }
     let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
     assert_preflight_depth_limit(error);

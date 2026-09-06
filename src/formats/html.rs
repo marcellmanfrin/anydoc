@@ -207,21 +207,48 @@ impl HtmlComplexitySink {
     fn close_element(&self, name: &LocalName) {
         let mut open = self.open_elements.borrow_mut();
         let name = name.as_ref();
-        let foreign = in_foreign_content(&open);
-        // html5ever never pops body/html on their end tags in HTML content:
-        // it only switches insertion modes (after body / after after body)
-        // and later start tags keep nesting in the existing tree.
-        // Truncating there would drop real open nesting and undercount
-        // depth. Inside foreign content, html/body are ordinary foreign
-        // elements whose matching end tags really do pop them.
-        if matches!(name, "body" | "html") && !foreign {
+        // html5ever routes an end tag through the foreign-content walk
+        // whenever the adjusted current node is foreign (integration points
+        // included). That walk truncates on a name match inside the foreign
+        // region (any namespace) and, failing that, reprocesses the token in
+        // the HTML insertion mode once it reaches an HTML element below the
+        // root. The unified scope walk at the bottom models the reprocessed
+        // rules. body/html and option/optgroup need the region distinction
+        // because their in-body rules never pop (mode switch / current-node
+        // check), while their foreign-region matches really do pop.
+        let foreign_root = in_foreign_content(&open).then(|| foreign_root_index(&open)).flatten();
+        if matches!(name, "body" | "html") {
+            if let Some(root) = foreign_root
+                && let Some((position, _)) = open
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .take_while(|(index, _)| *index >= root)
+                    .find(|(_, candidate)| candidate.as_ref() == name)
+            {
+                open.truncate(position);
+            }
+            // In HTML content these end tags only switch insertion modes
+            // (after body / after after body); later start tags keep nesting
+            // in the existing tree, so the modeled stack must stay untouched.
             return;
         }
-        // html5ever checks only the current node for option/optgroup end
-        // tags; searching deeper would truncate real nesting the parser
-        // keeps open. In foreign content they are ordinary foreign elements,
-        // so the generic walk below applies instead.
-        if matches!(name, "option" | "optgroup") && !foreign {
+        if matches!(name, "option" | "optgroup") {
+            if let Some(root) = foreign_root {
+                if let Some((position, _)) = open
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .take_while(|(index, _)| *index >= root)
+                    .find(|(_, candidate)| candidate.as_ref() == name)
+                {
+                    open.truncate(position);
+                }
+                return;
+            }
+            // In HTML content html5ever checks only the current node for
+            // these end tags; searching deeper would truncate real nesting
+            // the parser keeps open.
             if name == "optgroup" && open.last().is_some_and(|top| top.as_ref() == "option") {
                 open.pop();
             }
@@ -230,12 +257,15 @@ impl HtmlComplexitySink {
             }
             return;
         }
-        // html5ever ignores an end tag whose element is not in scope; the
-        // scope search stops at markers that depend on the end tag (table
-        // scope for the table family, list-item scope for li, button scope
-        // for p/dd/dt, ruby scope for rt/rp) and at svg/math foreign roots
-        // for every HTML end tag. Truncating on an out-of-scope match would
-        // pop real nesting and undercount depth.
+        // Unified walk: models both the foreign-phase name-match pop (bare
+        // svg/math roots do not stop it) and the reprocessed in-body scope
+        // rules. html5ever ignores an end tag whose element is not in scope;
+        // the search stops at markers that depend on the end tag (table scope
+        // for the table family, list-item scope for li, button scope for
+        // p/dd/dt, ruby scope for rt/rp, the special category for any other
+        // end tag). Truncating on an out-of-scope match would pop real
+        // nesting and undercount depth; ignoring an in-scope match would
+        // over-count and can falsely reject valid documents.
         for (position, candidate) in open.iter().enumerate().rev() {
             if candidate.as_ref() == name {
                 open.truncate(position);
@@ -255,18 +285,8 @@ impl HtmlComplexitySink {
         let mut open = self.open_elements.borrow_mut();
         // html5ever pops until the current node is an HTML integration point
         // or an HTML element, so nested foreign roots (svg inside math, etc.)
-        // all leave the stack. Track the outermost svg/math reachable from the
-        // top without crossing an integration point, and truncate there.
-        let mut outermost = None;
-        for (index, candidate) in open.iter().enumerate().rev() {
-            match candidate.as_ref() {
-                "foreignobject" | "desc" | "title" | "mi" | "mo" | "mn" | "ms" | "mtext"
-                | "annotation-xml" => break,
-                "svg" | "math" => outermost = Some(index),
-                _ => {}
-            }
-        }
-        if let Some(index) = outermost {
+        // all leave the stack: truncate at the outermost reachable root.
+        if let Some(index) = foreign_root_index(&open) {
             open.truncate(index);
         }
     }
@@ -338,30 +358,40 @@ impl TokenSink for HtmlComplexitySink {
     }
 }
 
-/// html5ever's generic scope markers: the elements that stop a scope search
-/// for end tags resolved through the generic scope. Per-tag scopes add their
-/// own markers (see is_end_tag_scope_marker).
-const GENERIC_SCOPE_MARKERS: &[&str] =
-    &["applet", "caption", "html", "table", "td", "th", "marquee", "object", "template"];
+/// html5ever's default scope markers (tag_sets.rs: html_default_scope plus
+/// the MathML text integration points and the SVG HTML integration points):
+/// the elements that stop scope searches for end tags resolved through the
+/// default scope. Per-tag scopes add their own markers (see
+/// is_end_tag_scope_marker). Bare svg/math roots are NOT markers: the parser
+/// pops through them to an in-scope target. Names are matched without
+/// namespaces (the modeled stack carries none); the only collision, the HTML
+/// <title>, stops searches that the <html> marker below it would stop anyway.
+const GENERIC_SCOPE_MARKERS: &[&str] = &[
+    "applet",
+    "caption",
+    "html",
+    "table",
+    "td",
+    "th",
+    "marquee",
+    "object",
+    "select",
+    "template",
+    // MathML text integration points and SVG HTML integration points.
+    "mi",
+    "mo",
+    "mn",
+    "ms",
+    "mtext",
+    "foreignobject",
+    "desc",
+    "title",
+];
 
 /// Scope markers that stop the search for an end tag's target element,
-/// mirroring html5ever's end-tag rules.
-///
-/// Bare svg/math roots stop every search. That is deliberate even though
-/// html5ever's in-body scope checks list the HTML/MathML integration points
-/// (foreignObject, desc, title, annotation-xml, mi/mo/mn/ms/mtext) rather
-/// than the roots: when a bare root is reachable by the search, the parser
-/// is in the foreign-content phase, whose end-tag walk stops at the first
-/// HTML element or integration point below the root and ignores the token
-/// there. Stopping at the root models the same outcome (ignore). Integration
-/// points always sit below their svg/math root, so a search that passed one
-/// would reach the root stop anyway; dropping the root stop instead would
-/// let scope-based end tags truncate through an open foreign root that the
-/// parser ignores, undercounting real nesting.
+/// mirroring html5ever's end-tag rules (tag_sets.rs scopes and the
+/// special_tag walk in process_end_tag_in_body).
 fn is_end_tag_scope_marker(end_tag: &str, candidate: &str) -> bool {
-    if matches!(candidate, "svg" | "math") {
-        return true;
-    }
     match end_tag {
         "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption" | "colgroup" => {
             matches!(candidate, "html" | "table" | "template")
@@ -426,14 +456,14 @@ fn is_generic_scope_end_tag(end_tag: &str) -> bool {
     )
 }
 
-/// html5ever's special element category (including the MathML text
-/// integration points and the SVG HTML integration points): the names that
-/// stop the any-other-end-tag walk and the list-item implied-close walk.
+/// html5ever's special element category (tag_sets.rs special_tag): the names
+/// that stop the any-other-end-tag walk (process_end_tag_in_body) and, minus
+/// address/div/p, the list-item implied-close walk. Integration points are
+/// NOT special there, and bare svg/math never were.
 fn is_special_element(candidate: &str) -> bool {
     matches!(
         candidate,
         "address"
-            | "annotation-xml"
             | "applet"
             | "area"
             | "article"
@@ -450,7 +480,6 @@ fn is_special_element(candidate: &str) -> bool {
             | "col"
             | "colgroup"
             | "dd"
-            | "desc"
             | "details"
             | "dir"
             | "div"
@@ -460,7 +489,6 @@ fn is_special_element(candidate: &str) -> bool {
             | "fieldset"
             | "figcaption"
             | "figure"
-            | "foreignobject"
             | "footer"
             | "form"
             | "frame"
@@ -479,7 +507,7 @@ fn is_special_element(candidate: &str) -> bool {
             | "iframe"
             | "img"
             | "input"
-            | "keygen"
+            | "isindex"
             | "li"
             | "link"
             | "listing"
@@ -487,11 +515,6 @@ fn is_special_element(candidate: &str) -> bool {
             | "marquee"
             | "menu"
             | "meta"
-            | "mi"
-            | "mn"
-            | "mo"
-            | "ms"
-            | "mtext"
             | "nav"
             | "noembed"
             | "noframes"
@@ -503,7 +526,6 @@ fn is_special_element(candidate: &str) -> bool {
             | "plaintext"
             | "pre"
             | "script"
-            | "search"
             | "section"
             | "select"
             | "source"
@@ -715,6 +737,24 @@ fn in_foreign_content(open: &[LocalName]) -> bool {
         }
     }
     false
+}
+
+/// Index of the outermost svg/math root reachable from the innermost open
+/// element without crossing an integration point, when the parser is inside
+/// foreign content. Elements at or above that index form the foreign region
+/// that html5ever's foreign-phase end-tag walk traverses (matching names in
+/// any namespace) before reprocessing the token in the HTML insertion mode.
+fn foreign_root_index(open: &[LocalName]) -> Option<usize> {
+    let mut outermost = None;
+    for (index, candidate) in open.iter().enumerate().rev() {
+        match candidate.as_ref() {
+            "foreignobject" | "desc" | "title" | "mi" | "mo" | "mn" | "ms" | "mtext"
+            | "annotation-xml" => break,
+            "svg" | "math" => outermost = Some(index),
+            _ => {}
+        }
+    }
+    outermost
 }
 
 fn html5_self_closing_is_honored(open: &[LocalName], name: &str) -> bool {
