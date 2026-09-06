@@ -680,6 +680,35 @@ fn any_other_end_tag_is_ignored_below_special_elements() {
 }
 
 #[test]
+fn frameset_with_many_sibling_frames_is_not_rejected_for_depth() {
+    // html5ever inserts each <frame> and immediately pops it (and ignores
+    // stray frames in body context), so hundreds of sibling frames stay
+    // shallow; the preflight must not stack them and falsely report
+    // max_xml_depth on a valid frameset document.
+    let mut html = String::from("<!doctype html><html><frameset>");
+    for _ in 0..300 {
+        html.push_str("<frame>");
+    }
+    html.push_str("</frameset></html>");
+    assert!(to_markdown_bytes(html.as_bytes(), Some(Format::Html)).is_ok());
+}
+
+#[test]
+fn markup_inside_select_really_nests_and_hits_the_depth_guard() {
+    // html5ever has no "in select" insertion mode: start tags inside a
+    // select are processed in body mode and really insert, so deep markup
+    // there must be rejected before DOM construction. Ignoring select
+    // content (as the HTML spec's in-select mode would) is what diverges
+    // from this parser and would undercount the real DOM.
+    let mut html = String::from("<!doctype html><body><select>");
+    for _ in 0..260 {
+        html.push_str("<div>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    assert_preflight_depth_limit(error);
+}
+
+#[test]
 fn li_start_does_not_close_items_below_special_elements() {
     // html5ever's li insertion walk stops at any special element other than
     // address/div/p, so each ul opens a new nesting level and the inner li
