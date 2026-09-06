@@ -652,9 +652,10 @@ fn close_implied_before_start(open: &mut Vec<LocalName>, name: &str) -> bool {
     }
 
     // Table-family start tags outside a table are ignored outright by
-    // html5ever in body context. Pushing them would let a later implied
-    // close truncate the real nesting opened between stray cells,
-    // undercounting depth; ignoring matches the parser exactly.
+    // html5ever in body context (the caption/col/.../tr arm of InBody).
+    // Pushing them would let a later implied close truncate the real
+    // nesting opened between stray cells, undercounting depth; ignoring
+    // matches the parser exactly.
     if matches!(
         name,
         "caption" | "col" | "colgroup" | "tbody" | "td" | "tfoot" | "th" | "thead" | "tr"
@@ -662,19 +663,23 @@ fn close_implied_before_start(open: &mut Vec<LocalName>, name: &str) -> bool {
         if !open.iter().any(|candidate| candidate.as_ref() == "table") {
             return true;
         }
-        // Inside a table, html5ever clears the stack back to the matching
-        // row or body context, popping everything above the target;
-        // truncating at the innermost match models exactly that.
-        let implied: &[&str] = match name {
-            "tr" => &["tr"],
-            "td" | "th" => &["td", "th"],
-            "tbody" | "thead" | "tfoot" => &["tbody", "thead", "tfoot"],
-            _ => &[],
-        };
-        if let Some(position) =
-            open.iter().rposition(|candidate| implied.contains(&candidate.as_ref()))
+        // Inside a table, every table-family start first clears the stack
+        // back to the table context (html5ever InTable:
+        // pop_until_current(table_scope) for caption, col, colgroup,
+        // tbody/tfoot/thead, and td/th/tr alike): foster-parented stray
+        // content above the table leaves the stack and previous rows or
+        // cells close. Without the clear, that stray content accumulates
+        // as phantom depth and valid repaired table markup can be falsely
+        // rejected at max_xml_depth. The phantom tbody/tr wrappers
+        // html5ever inserts afterwards are not modeled (a bounded,
+        // documented deviation), and a template above the table stops the
+        // clear exactly as table_scope does.
+        if let Some(clear_to) = open
+            .iter()
+            .rposition(|candidate| matches!(candidate.as_ref(), "table" | "template" | "html"))
+            .map(|index| index + 1)
         {
-            open.truncate(position);
+            open.truncate(clear_to);
         }
         return false;
     }

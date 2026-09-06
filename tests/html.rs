@@ -454,6 +454,7 @@ fn html_title_still_swallows_markup_as_raw_text() {
     let html = br#"<!doctype html><html><head><title><div>not markup</div></title></head><body><p>ok</p></body></html>"#;
     let markdown = to_markdown_bytes(html, Some(Format::Html)).unwrap();
     assert!(markdown.contains("ok"), "got: {markdown:?}");
+    assert!(!markdown.contains("not markup"), "got: {markdown:?}");
 }
 
 #[test]
@@ -472,9 +473,14 @@ fn foreign_content_script_does_not_swallow_nested_markup() {
 
 #[test]
 fn html_script_still_swallows_markup_as_script_data() {
-    let html = br#"<!doctype html><html><head><script>var x = "<div>";</script></head><body><p>ok</p></body></html>"#;
+    // The script sits in the body so a tokenizer that failed to enter
+    // ScriptData would render its source as text; the negative assertions
+    // are what actually guard the raw-text swallow.
+    let html = br#"<!doctype html><html><body><script>var x = "<div>not markup</div>";</script><p>ok</p></body></html>"#;
     let markdown = to_markdown_bytes(html, Some(Format::Html)).unwrap();
     assert!(markdown.contains("ok"), "got: {markdown:?}");
+    assert!(!markdown.contains("var x"), "got: {markdown:?}");
+    assert!(!markdown.contains("not markup"), "got: {markdown:?}");
 }
 
 #[test]
@@ -706,6 +712,22 @@ fn markup_inside_select_really_nests_and_hits_the_depth_guard() {
     }
     let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
     assert_preflight_depth_limit(error);
+}
+
+#[test]
+fn table_family_starts_clear_stray_content_above_the_table() {
+    // html5ever clears the stack back to the table context for caption,
+    // col, colgroup, tbody/tfoot/thead, and td/th/tr starts, popping
+    // foster-parented stray content; keeping that content on the modeled
+    // stack would accumulate phantom depth and falsely reject valid
+    // repaired table markup at max_xml_depth.
+    let mut html = String::from("<!doctype html><body><table>");
+    for _ in 0..253 {
+        html.push_str("<div>");
+    }
+    html.push_str("<tbody><tr><td>celula</td></tr></tbody></table>");
+    let markdown = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap();
+    assert!(markdown.contains("celula"), "got: {markdown:?}");
 }
 
 #[test]
