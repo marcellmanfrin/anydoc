@@ -353,6 +353,13 @@ impl TokenSink for HtmlComplexitySink {
                     // html5ever 0.39 does not switch the tokenizer for script
                     // inside foreign content either (its foreign_start_tag has
                     // no ScriptData transition), so script is gated too.
+                    // The switch is unconditional in HTML content because
+                    // html5ever inserts title/textarea in every mode that
+                    // accepts them (InHead, InBody, InTemplate, and the table
+                    // modes that reprocess start tags through InBody); the
+                    // modes that ignore them (the frameset family) also ignore
+                    // every subsequent start tag, so no deep DOM can hide
+                    // behind the raw-text state.
                     let foreign = in_foreign_content(&self.open_elements.borrow());
                     if is_void_html_element(name) && !foreign {
                         // Void HTML elements never push, but their start tags
@@ -850,6 +857,13 @@ fn is_foreign_content_html_breakout(name: &str) -> bool {
     )
 }
 
+/// Elements that never stay on the open-element stack in HTML content: the
+/// void elements, plus frame. html5ever ignores a stray frame in body
+/// context (rules.rs, the caption/col/.../tr ignore arm) and inserts then
+/// immediately pops it in frameset context (insert_and_pop_element_for), so
+/// stacking frames would falsely report max_xml_depth for framesets with
+/// more than MAX_XML_DEPTH sibling frames. In foreign content a frame is an
+/// ordinary foreign element that does push (callers gate on that).
 fn is_void_html_element(name: &str) -> bool {
     matches!(
         name,
@@ -858,6 +872,7 @@ fn is_void_html_element(name: &str) -> bool {
             | "br"
             | "col"
             | "embed"
+            | "frame"
             | "hr"
             | "img"
             | "input"
