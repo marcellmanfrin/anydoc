@@ -731,6 +731,21 @@ fn table_family_starts_clear_stray_content_above_the_table() {
 }
 
 #[test]
+fn block_starts_close_paragraphs_with_inline_descendants() {
+    // html5ever closes an open p (in button scope) when a block start tag
+    // arrives, popping its inline descendants too. Leaving the stale p on
+    // the modeled stack made a later <p> start truncate through the
+    // intervening blockquote, undercounting the nested blockquotes the
+    // parser really keeps open.
+    let mut html = String::from("<!doctype html><body>");
+    for _ in 0..255 {
+        html.push_str("<blockquote><p><b>");
+    }
+    let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+    assert_preflight_depth_limit(error);
+}
+
+#[test]
 fn li_start_does_not_close_items_below_special_elements() {
     // html5ever's li insertion walk stops at any special element other than
     // address/div/p, so each ul opens a new nesting level and the inner li

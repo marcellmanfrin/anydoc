@@ -571,14 +571,25 @@ fn close_implied_before_start(open: &mut Vec<LocalName>, name: &str) -> bool {
     }
 
     // HTML5 implicitly closes an open <p> when a block-level start tag
-    // arrives. Model the case where the <p> is the innermost open element;
-    // deeper arrangements stay over-counted, keeping the preflight
-    // fail-closed. Void tags reach this hook through close_implied (so <hr>
-    // does close an open <p>) without being pushed themselves.
-    if is_paragraph_closing_element(name)
-        && open.last().is_some_and(|candidate| candidate.as_ref() == "p")
-    {
-        open.pop();
+    // arrives: html5ever closes the p whenever it is in button scope,
+    // popping its inline descendants with it (close_p_element_in_button_
+    // scope). Modeling only the innermost-p case left stale paragraphs
+    // below intervening elements; a later p start would then find the
+    // stale p and truncate through those elements, UNDERcounting the
+    // nesting the parser really keeps open. Void tags reach this hook
+    // through close_implied (so <hr> does close an open <p>) without being
+    // pushed themselves.
+    if is_paragraph_closing_element(name) {
+        for (position, candidate) in open.iter().enumerate().rev() {
+            let candidate = candidate.as_ref();
+            if candidate == "p" {
+                open.truncate(position);
+                break;
+            }
+            if candidate == "button" || GENERIC_SCOPE_MARKERS.contains(&candidate) {
+                break;
+            }
+        }
     }
 
     // html5ever pops the current node only when it is already a heading
@@ -667,21 +678,6 @@ fn close_implied_before_start(open: &mut Vec<LocalName>, name: &str) -> bool {
             }
         }
         return false;
-    }
-
-    // p: html5ever closes an open p only when it is in button scope, so the
-    // search stops at button and the generic scope markers.
-    if name == "p" {
-        for (position, candidate) in open.iter().enumerate().rev() {
-            let candidate = candidate.as_ref();
-            if candidate == "p" {
-                open.truncate(position);
-                break;
-            }
-            if candidate == "button" || GENERIC_SCOPE_MARKERS.contains(&candidate) {
-                break;
-            }
-        }
     }
 
     false
