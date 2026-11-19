@@ -2,11 +2,13 @@
 //! semantic HTML -> document-model frontend used by EPUB.
 
 use crate::error::ConvertError;
-use crate::model::{AnchorId, Document, ImageSource, LinkTarget};
+use crate::model::{AnchorId, AssetId, Document, ImageSource, LinkTarget};
 use crate::package::limits;
 use crate::package::xml::{Attr, Element, Node};
+use crate::shared::assets::AssetSink;
 use crate::shared::html::{HtmlCtx, Stylesheet};
 use crate::shared::uri::is_absolute_uri;
+use data_url::{DataUrl, DataUrlError};
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, WINDOWS_1252};
 use html5ever::LocalName;
 use html5ever::tendril::StrTendril;
@@ -16,6 +18,7 @@ use html5ever::tokenizer::{
 };
 use scraper::{ElementRef, Html, Node as HtmlNode};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 /// Parse a standalone HTML document into anydoc's document model.
@@ -58,9 +61,10 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
 
     let mut node_count = 0usize;
     let body = adapt_element(body, 1, &mut node_count)?;
-    let blocks = crate::shared::html::to_blocks(&body, &css, &StandaloneCtx)?;
+    let ctx = StandaloneCtx::default();
+    let blocks = crate::shared::html::to_blocks(&body, &css, &ctx)?;
 
-    Ok(Document { blocks, ..Document::default() })
+    Ok(Document { blocks, assets: ctx.assets.into_inner().assets, ..Document::default() })
 }
 
 fn decode_html(bytes: &[u8]) -> String {
@@ -640,22 +644,48 @@ fn close_implied_before_start(open: &mut Vec<LocalName>, name: &str) -> bool {
             return true;
         }
         // Inside a table, every table-family start first clears the stack
-        // back to the table context (html5ever InTable:
-        // pop_until_current(table_scope) for caption, col, colgroup,
-        // tbody/tfoot/thead, and td/th/tr alike): foster-parented stray
-        // content above the table leaves the stack and previous rows or
-        // cells close. Without the clear, that stray content accumulates
-        // as phantom depth and valid repaired table markup can be falsely
-        // rejected at max_xml_depth. The phantom tbody/tr wrappers
-        // html5ever inserts afterwards are not modeled (a bounded,
-        // documented deviation), and a template above the table stops the
-        // clear exactly as table_scope does.
-        if let Some(clear_to) = open
+        // back to the context of its insertion mode: the table for caption,
+        // col, colgroup and tbody/tfoot/thead (InTable), the open row group
+        // for tr (InTableBody), and the open row for td/th (InRow).
+        // Foster-parented stray content above the table and previous rows
+        // or cells leave the stack. Without the clear, that stray content
+        // accumulates as phantom depth and valid repaired table markup can
+        // be falsely rejected at max_xml_depth. Clearing further than the
+        // parser does (to the table for every start) drops the row group and
+        // row html5ever keeps open, undercounting each nested table by two
+        // levels. When the row group or row is missing, html5ever inserts an
+        // implied tbody and/or tr, which really nest, so they are pushed
+        // too; template contents take cells and rows directly. A template
+        // above the table stops the clear exactly as table_scope does.
+        if let Some(context) = open
             .iter()
             .rposition(|candidate| matches!(candidate.as_ref(), "table" | "template" | "html"))
-            .map(|index| index + 1)
         {
+            let implies_wrappers = open[context].as_ref() == "table";
+            let innermost = |names: &[&str]| {
+                open[context + 1..]
+                    .iter()
+                    .rposition(|candidate| names.contains(&candidate.as_ref()))
+                    .map(|index| context + 1 + index)
+            };
+            let row_group = innermost(&["tbody", "thead", "tfoot"]);
+            let row = innermost(&["tr"]);
+            let (clear_to, implied): (usize, &[&str]) = match name {
+                "td" | "th" => match (row, row_group) {
+                    (Some(row), _) => (row + 1, &[]),
+                    (None, Some(row_group)) => (row_group + 1, &["tr"]),
+                    (None, None) => (context + 1, &["tbody", "tr"]),
+                },
+                "tr" => match row_group {
+                    Some(row_group) => (row_group + 1, &[]),
+                    None => (context + 1, &["tbody"]),
+                },
+                _ => (context + 1, &[]),
+            };
             open.truncate(clear_to);
+            if implies_wrappers {
+                open.extend(implied.iter().map(|&wrapper| LocalName::from(wrapper)));
+            }
         }
         return false;
     }
@@ -957,12 +987,22 @@ fn bump_node_count(node_count: &mut usize) -> Result<(), ConvertError> {
     Ok(())
 }
 
-struct StandaloneCtx;
+#[derive(Default)]
+struct StandaloneCtx {
+    assets: RefCell<AssetSink>,
+    /// The asset each data: image source became, so repeats of one source
+    /// (lazy-load placeholders, say) share it, as repeated references to one
+    /// package part do in other formats.
+    data_uri_assets: RefCell<HashMap<String, AssetId>>,
+}
 
 impl HtmlCtx for StandaloneCtx {
     fn link_target(&self, href: &str) -> Option<LinkTarget> {
         let href = href.trim();
-        if href.is_empty() {
+        // A data: URI embeds its payload rather than pointing anywhere, so
+        // the link keeps only its text. The parser recognises one as browsers
+        // do, ignoring tabs and newlines.
+        if href.is_empty() || !matches!(DataUrl::process(href), Err(DataUrlError::NotADataUrl)) {
             return None;
         }
         if let Some(fragment) = href.strip_prefix('#') {
@@ -986,6 +1026,29 @@ impl HtmlCtx for StandaloneCtx {
         let src = src.trim();
         if src.is_empty() {
             return Ok(None);
+        }
+        // A data: URI embeds the image itself, so it is retained as an asset
+        // like other formats' embedded images (and renders as its alt text).
+        // The parser recognises one as browsers do, ignoring tabs and
+        // newlines; one that does not parse or decode keeps only its alt text.
+        match DataUrl::process(src) {
+            Err(DataUrlError::NotADataUrl) => {}
+            Err(DataUrlError::NoComma) => return Ok(Some(ImageSource::Unavailable)),
+            Ok(url) => {
+                if let Some(&id) = self.data_uri_assets.borrow().get(src) {
+                    return Ok(Some(ImageSource::Asset(id)));
+                }
+                let mime = url.mime_type();
+                let media_type = format!("{}/{}", mime.type_, mime.subtype);
+                let Ok((bytes, _)) = url.decode_to_vec() else {
+                    return Ok(Some(ImageSource::Unavailable));
+                };
+                let mut assets = self.assets.borrow_mut();
+                let origin_part = format!("data-uri/{}", assets.assets.len());
+                let id = assets.add(media_type, origin_part, &bytes)?;
+                self.data_uri_assets.borrow_mut().insert(src.to_owned(), id);
+                return Ok(Some(ImageSource::Asset(id)));
+            }
         }
         Ok(Some(ImageSource::External(src.to_owned())))
     }

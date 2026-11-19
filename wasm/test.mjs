@@ -69,6 +69,13 @@ test('format detection reads content, extension, and path', () => {
   assert.equal(formatFromPath('/tmp/report.unknown'), undefined)
 })
 
+test('standalone HTML is detected and converted', () => {
+  const input = new TextEncoder().encode('<!doctype html><h1>Hello</h1><p><b>world</b></p>')
+  assert.equal(formatFromExtension('html'), 'html')
+  assert.equal(formatFromBytes(input), 'html')
+  assert.equal(toMarkdownBytes(input), '# Hello\n\n**world**\n')
+})
+
 // `code` is what callers branch on, so every kind of failure is pinned here.
 test('conversion errors throw a coded Error', () => {
   const throws = (call, code, message) =>

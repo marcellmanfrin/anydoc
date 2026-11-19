@@ -331,6 +331,92 @@ fn frameset_html_converts_without_body_error() {
     assert_eq!(to_markdown_bytes(html, Some(Format::Html)).unwrap(), "");
 }
 
+// tests/fixture-src/dot.png, base64-encoded (gen_fixtures.py's DOT_PNG).
+const DOT_PNG_DATA_URI: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+#[test]
+fn data_uri_image_is_retained_as_an_asset() {
+    let html = format!(
+        r#"<!doctype html><p>Before <img alt="tiny dot" src="{DOT_PNG_DATA_URI}"> after</p>"#
+    );
+    let markdown = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap();
+    assert_eq!(markdown, "Before tiny dot after\n");
+
+    let document = to_document(html.as_bytes(), Some(Format::Html)).unwrap();
+    match &document.blocks[0] {
+        Block::Paragraph(inlines) => assert!(
+            inlines.iter().any(|inline| matches!(
+                inline,
+                Inline::Image { source: ImageSource::Asset(id), .. } if id.0 == 0
+            )),
+            "got: {inlines:?}"
+        ),
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+    let [asset] = &document.assets[..] else {
+        panic!("expected one asset, got {}", document.assets.len());
+    };
+    assert_eq!(asset.media_type, "image/png");
+    assert_eq!(asset.bytes, include_bytes!("fixture-src/dot.png"));
+}
+
+#[test]
+fn repeated_data_uri_image_shares_one_asset() {
+    let html = format!(
+        r#"<!doctype html><p><img alt="tiny dot" src="{DOT_PNG_DATA_URI}"> and <img alt="tiny dot" src="{DOT_PNG_DATA_URI}"></p>"#
+    );
+    let document = to_document(html.as_bytes(), Some(Format::Html)).unwrap();
+    assert_eq!(document.assets.len(), 1);
+    match &document.blocks[0] {
+        Block::Paragraph(inlines) => {
+            let assets: Vec<_> = inlines
+                .iter()
+                .filter_map(|inline| match inline {
+                    Inline::Image { source: ImageSource::Asset(id), .. } => Some(id.0),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(assets, [0, 0]);
+        }
+        other => panic!("expected paragraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn undecodable_data_uri_image_keeps_only_its_alt_text() {
+    // Bad base64, and a data: URI with no comma, which doesn't parse at all.
+    for src in ["data:image/png;base64,not*base64", "data:image/png;base64"] {
+        let html =
+            format!(r#"<!doctype html><p>Before <img alt="tiny dot" src="{src}"> after</p>"#);
+        let markdown = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap();
+        assert_eq!(markdown, "Before tiny dot after\n", "src: {src}");
+        assert!(to_document(html.as_bytes(), Some(Format::Html)).unwrap().assets.is_empty());
+    }
+}
+
+#[test]
+fn data_uri_link_keeps_only_its_text() {
+    // Browsers ignore a newline inside the scheme, and one with no comma is
+    // still a data: URI.
+    for href in
+        ["data:text/plain,hello%20world", "da&#10;ta:text/plain,hello%20world", "data:text/plain"]
+    {
+        let html = format!(r#"<!doctype html><p><a href="{href}">download</a></p>"#);
+        let markdown = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap();
+        assert_eq!(markdown, "download\n", "href: {href}");
+    }
+}
+
+#[test]
+fn data_uri_image_with_a_newline_in_its_scheme_is_an_asset() {
+    // Browsers ignore tabs and newlines in a URL, so this is still a data: URI.
+    let src = DOT_PNG_DATA_URI.replacen("data:", "da&#10;ta:", 1);
+    let html = format!(r#"<!doctype html><p>Before <img alt="tiny dot" src="{src}"> after</p>"#);
+    let markdown = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap();
+    assert_eq!(markdown, "Before tiny dot after\n");
+    assert_eq!(to_document(html.as_bytes(), Some(Format::Html)).unwrap().assets.len(), 1);
+}
+
 #[test]
 fn relative_image_is_preserved_without_fetching() {
     let html = br#"<!doctype html><p><img src="images/pixel.png"></p>"#;
@@ -450,11 +536,15 @@ fn foreign_content_title_does_not_swallow_nested_markup() {
 #[test]
 fn html_title_still_swallows_markup_as_raw_text() {
     // The HTML (non-foreign) <title> keeps RCDATA semantics: nested markup is
-    // text, not elements, and the document converts normally.
-    let html = br#"<!doctype html><html><head><title><div>not markup</div></title></head><body><p>ok</p></body></html>"#;
-    let markdown = to_markdown_bytes(html, Some(Format::Html)).unwrap();
+    // text, so the preflight must not count it and the document converts.
+    // Counted as elements, the divs would be rejected at max_xml_depth.
+    let mut html = String::from("<!doctype html><html><head><title>");
+    for _ in 0..300 {
+        html.push_str("<div>");
+    }
+    html.push_str("</title></head><body><p>ok</p></body></html>");
+    let markdown = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap();
     assert!(markdown.contains("ok"), "got: {markdown:?}");
-    assert!(!markdown.contains("not markup"), "got: {markdown:?}");
 }
 
 #[test]
@@ -757,6 +847,35 @@ fn li_start_does_not_close_items_below_special_elements() {
     }
     let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
     assert_preflight_depth_limit(error);
+}
+
+#[test]
+fn nested_tables_count_row_groups_and_rows_in_the_preflight() {
+    // Each nested table really nests table > tbody > tr > td, whether the
+    // markup names the row group and row or html5ever implies them, so 70
+    // levels (about 280 deep) must be rejected before DOM construction.
+    for level in ["<table><tbody><tr><td>", "<table><tr><td>", "<table><td>"] {
+        let html = format!("<!doctype html><body>{}x", level.repeat(70));
+        let error = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap_err();
+        assert_preflight_depth_limit(error);
+    }
+}
+
+#[test]
+fn nested_tables_under_the_depth_limit_convert() {
+    let html = format!("<!doctype html><body>{}x", "<table><td>".repeat(60));
+    let markdown = to_markdown_bytes(html.as_bytes(), Some(Format::Html)).unwrap();
+    assert!(markdown.contains('x'), "got: {markdown:?}");
+}
+
+#[test]
+fn template_cells_inside_nested_tables_imply_no_wrappers() {
+    // Inside a <template> html5ever inserts cells and rows directly, with no
+    // implied tbody/tr, so each level here is table > tbody > tr > td >
+    // template > td (6 deep): 40 levels convert. Pushing wrappers inside the
+    // template too would count 8 per level and falsely reject them.
+    let html = format!("<!doctype html><body>{}x", "<table><td><template><td>".repeat(40));
+    assert!(to_markdown_bytes(html.as_bytes(), Some(Format::Html)).is_ok());
 }
 
 #[test]
